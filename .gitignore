@@ -1,0 +1,7 @@
+# Python system files
+__pycache__/
+*.py[cod]
+
+# Revit backup files
+*.000*.rvt
+*.bak
