@@ -50,6 +50,11 @@ MAPPING_PATH  = os.path.join(OUTPUT_DIR, MAPPING_FILE)
 if not os.path.isdir(OUTPUT_DIR):
     os.makedirs(OUTPUT_DIR)
 
+
+SHEATHING_THICKNESS_IN = 0.625
+STUD_DEPTH_IN = 6.0
+PANEL_TOTAL_THICKNESS_IN = SHEATHING_THICKNESS_IN + STUD_DEPTH_IN
+
 # ========== HELPERS ==========
 try:
     basestring
@@ -165,6 +170,64 @@ def get_sequential_wall_geometry(walls):
         'min_z':     min_z
     }
 
+
+
+def _normalize_xy(v):
+    mag = (v.X * v.X + v.Y * v.Y) ** 0.5
+    if mag < 1e-9:
+        return None
+    return XYZ(v.X / mag, v.Y / mag, 0.0)
+
+def _vec_str(v, nd=6):
+    if not v:
+        return ""
+    return "({0},{1},{2})".format(rnum(v.X, nd), rnum(v.Y, nd), rnum(v.Z, nd))
+
+def get_facade_basis(walls, building_centroid_xy=None):
+    """
+    Returns:
+        outward_normal : unit XY vector pointing to the true exterior
+        left_to_right  : unit XY vector representing visual LEFT->RIGHT
+                         when standing OUTSIDE and looking at the facade
+        origin         : facade start point at the visual-left end
+        end            : facade end point at the visual-right end
+        length_ft      : facade run length
+    """
+    geo = get_sequential_wall_geometry(walls)
+    origin = geo['start']
+    end    = geo['end']
+    length_ft = geo['length']
+
+    rep = walls[0]
+    outward = _normalize_xy(rep.Orientation)
+    if outward is None:
+        raise Exception("Could not compute facade outward normal from wall.Orientation.")
+
+    # Midpoint of facade
+    midx = (origin.X + end.X) / 2.0
+    midy = (origin.Y + end.Y) / 2.0
+
+    # Flip if normal points toward centroid (interior)
+    if building_centroid_xy is not None:
+        vx = building_centroid_xy[0] - midx
+        vy = building_centroid_xy[1] - midy
+        dot = vx * outward.X + vy * outward.Y
+        if dot > 0:
+            outward = XYZ(-outward.X, -outward.Y, 0.0)
+
+    # Visual LEFT -> RIGHT when standing OUTSIDE and facing the wall
+    left_to_right = outward.CrossProduct(XYZ.BasisZ)
+    left_to_right = _normalize_xy(left_to_right)
+    if left_to_right is None:
+        raise Exception("Could not compute facade left-to-right axis.")
+
+    return {
+        "outward_normal": outward,
+        "left_to_right": left_to_right,
+        "origin": origin,
+        "end": end,
+        "length_ft": length_ft
+    }
 
 # ========== FACADE GROUPING HELPERS ==========
 
@@ -367,7 +430,12 @@ try:
             "CurveType","Start(X,Y,Z)","End(X,Y,Z)","Mid(X,Y,Z)","CurveLength(ft)",
             "ArcRadius(ft)","ArcAngle(rad)","ArcCenter(X,Y,Z)","AxisDir(unit XYZ)","Normal(unit XYZ)",
             "StructFaceOffset(ft)","PanelStartExt(in)","PanelEndExt(in)",
-            "Layers","WallCount","LevelElevations(in)"
+            "Layers","WallCount","LevelElevations(in)",
+            # --- canonical facade basis for downstream scripts ---
+            "wall_origin_x","wall_origin_y","wall_origin_z",
+            "wall_dir_x","wall_dir_y","wall_dir_z",
+            "wall_normal_x","wall_normal_y","wall_normal_z",
+            "panel_total_thickness_in","sheathing_thickness_in","stud_depth_in"
         ])
 
         if not _group_data:

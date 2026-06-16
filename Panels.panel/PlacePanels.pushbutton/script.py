@@ -9,10 +9,13 @@ Placing on a back facade? Select "Force End (Right)" for X Ref and "Force 180" f
 
 Placing on a left facade? Select "Force End (Right)" for X Ref and "Force -90" for Rotation.
 
+NOTE: If you choose "Use CSV Rotation" in the Set Rotation dialog, panels are
+now auto-rotated to face the wall's true exterior normal (via
+_face_panel_outward), so the manual Force options above shouldn't be
+necessary anymore. They're kept available as a manual fallback/override in
+case a wall's geometry or family doesn't support FacingOrientation.
 
 """
-
-
 
 from Autodesk.Revit.DB import (
     FilteredElementCollector, Wall, Transaction, XYZ, Line,
@@ -61,8 +64,8 @@ BBOX_ALIGN_TOLERANCE_IN = 0.125
 ENABLE_VOID_CONTROL = True
 
 # --- DEPTH SETTINGS ---
-PANEL_THICKNESS_IN = 4.0
-FAMILY_ORIGIN_LOCATION = "Center"  # depth axis: "Center", "Front", or "Back"
+PANEL_THICKNESS_IN = 6.625  # 6" stud + 5/8" sheathing
+FAMILY_ORIGIN_LOCATION = "Back"  # Matches the red dot on your interior stud face
 MANUAL_DEPTH_OFFSET_IN = 0.0
 
 # --- COORDINATE SETTINGS ---
@@ -87,7 +90,6 @@ V1_UNIT_HEIGHT  = "UNIT 1 HEIGHT"
 V1_JAMB_CLR     = "VOID 1 JAMB CLR"
 V1_HEAD_CLR     = "VOID 1 HEAD CLR"
 V1_SILL_CLR     = "VOID 1 SILL CLR"
-# [FIX] Canonical X offset name is "Void 1 X Offset Left"; fall back to older variants
 V1_X_OFFSET_CANDIDATES = ["Void 1 X Offset Left", "Void 1 X Offset", "V1_X_OFFSET"]
 V1_Y_OFFSET     = "Void 1 Y Offset"
 V1_VISIBLE      = "VOID 1"
@@ -97,7 +99,6 @@ V2_UNIT_HEIGHT  = "UNIT 2 HEIGHT"
 V2_JAMB_CLR     = "VOID 2 JAMB CLR"
 V2_HEAD_CLR     = "VOID 2 HEAD CLR"
 V2_SILL_CLR     = "VOID 2 SILL CLR"
-# [FIX] Canonical X offset name is "Void 2 X Offset Left"; fall back to older variants
 V2_X_OFFSET_CANDIDATES = ["Void 2 X Offset Left", "Void 2 X Offset", "V2_X_OFFSET"]
 V2_Y_OFFSET     = "Void 2 Y Offset"
 V2_VISIBLE      = "VOID 2"
@@ -188,228 +189,41 @@ def get_wall_base_elevation(wall):
         pass
     return base_z
 
-
-def get_core_center_offset_from_ext_face(wall):
-    total_wall_width = wall.Width
-    target_depth_inward = total_wall_width / 2.0
-
-    try:
-        cs = wall.WallType.GetCompoundStructure()
-        if cs:
-            layers = list(cs.GetLayers())
-            cumulative = 0.0
-            core_start = None
-            core_end = None
-            for i, layer in enumerate(layers):
-                if cs.IsCoreLayer(i):
-                    if core_start is None:
-                        core_start = cumulative
-                    core_end = cumulative + layer.Width
-                cumulative += layer.Width
-            if core_start is not None and core_end is not None:
-                target_depth_inward = (core_start + core_end) / 2.0
-                print("  [CORE] Core span: {0:.4f} to {1:.4f} ft, center at {2:.4f} ft from ext face".format(
-                    core_start, core_end, target_depth_inward))
-            else:
-                print("  [CORE] No IsCoreLayer layers found, using wall center.")
-        else:
-            print("  [CORE] No CompoundStructure, using wall center.")
-    except Exception as e:
-        print("  [CORE] CompoundStructure read failed: {0}".format(e))
-
-    return target_depth_inward
-
-
-def get_wall_geometry_normalized(wall):
-    lc = wall.Location.Curve
-    p0 = lc.GetEndPoint(0)
-    p1 = lc.GetEndPoint(1)
-
-    normal = wall.Orientation
-    up = XYZ(0, 0, 1)
-    visual_right_dir = normal.CrossProduct(up)
-
-    dot0 = p0.DotProduct(visual_right_dir)
-    dot1 = p1.DotProduct(visual_right_dir)
-    if dot0 < dot1:
-        visual_left, visual_right = p0, p1
-    else:
-        visual_left, visual_right = p1, p0
-
-    normalized_dir = (visual_right - visual_left).Normalize()
-    core_depth_from_ext = get_core_center_offset_from_ext_face(wall)
-
-    loc_line_depth_from_ext = None
-    try:
-        refs = HostObjectUtils.GetSideFaces(wall, ShellLayerType.Exterior)
-        if refs:
-            face = wall.GetGeometryObjectFromReference(refs[0])
-            if isinstance(face, PlanarFace):
-                vec = p0 - face.Origin
-                signed = vec.DotProduct(face.FaceNormal)
-                loc_line_depth_from_ext = -signed
-                w = wall.Width
-                if not (-(w * 0.05) <= loc_line_depth_from_ext <= w * 1.05):
-                    print("  [WARN] loc_line_depth={0:.4f} outside wall width={1:.4f}, clamping.".format(
-                        loc_line_depth_from_ext, w))
-                    loc_line_depth_from_ext = max(0.0, min(w, loc_line_depth_from_ext))
-                print("  [CORE] Location line depth from ext face: {0:.4f} ft".format(loc_line_depth_from_ext))
-    except Exception as e:
-        print("  [WARN] GetSideFaces failed: {0}".format(e))
-
-    if loc_line_depth_from_ext is None:
-        try:
-            w = wall.Width
-            cs = wall.WallType.GetCompoundStructure()
-            layers = list(cs.GetLayers()) if cs else []
-            loc_line_param = wall.get_Parameter(BuiltInParameter.WALL_KEY_REF_PARAM)
-            loc_line = loc_line_param.AsInteger() if loc_line_param else 0
-            if loc_line == 0:
-                loc_line_depth_from_ext = w / 2.0
-            elif loc_line == 1:
-                loc_line_depth_from_ext = core_depth_from_ext
-            elif loc_line == 2:
-                loc_line_depth_from_ext = 0.0
-            elif loc_line == 3:
-                loc_line_depth_from_ext = w
-            elif loc_line == 4:
-                ext_finish = sum(
-                    layers[i].Width for i in range(len(layers))
-                    if not cs.IsCoreLayer(i) and i < next(
-                        (j for j in range(len(layers)) if cs.IsCoreLayer(j)), 0)
-                ) if cs else 0.0
-                loc_line_depth_from_ext = ext_finish
-            elif loc_line == 5:
-                last_core = next(
-                    (j for j in reversed(range(len(layers))) if cs.IsCoreLayer(j)), len(layers) - 1
-                ) if cs else len(layers) - 1
-                int_finish = sum(
-                    layers[i].Width for i in range(last_core + 1, len(layers))
-                    if not cs.IsCoreLayer(i)
-                ) if cs else 0.0
-                loc_line_depth_from_ext = w - int_finish
-            else:
-                loc_line_depth_from_ext = w / 2.0
-            print("  [CORE] Fallback: loc_line param={0}, depth from ext={1:.4f} ft".format(
-                loc_line, loc_line_depth_from_ext))
-        except Exception as e:
-            print("  [WARN] Location line param fallback failed: {0}. Using wall center.".format(e))
-            loc_line_depth_from_ext = wall.Width / 2.0
-
-    core_center_offset = loc_line_depth_from_ext - core_depth_from_ext
-    print("  [CORE] Final offset loc_line -> core center: {0:.4f} ft".format(core_center_offset))
-    return visual_left, visual_right, normalized_dir, normal, core_center_offset
-
-
-def compute_panel_base_point(wall, panel, rotation_deg=0.0, extra_z_offset_in=0.0):
-    """
-    Insertion point for a family whose origin is at BOTTOM-CENTER.
-
-    x_in  = left edge of panel from wall visual start (inches) -- from CSV
-    y_in  = bottom of panel from wall curve base Z (inches) -- from CSV
-
-    FIX 2 (coordinate source):
-      panel_calculator now bakes wall_origin_x/y/z and wall_dir_x/y/z into
-      every panel row.  We use those directly instead of re-deriving vis_left
-      from the Revit element -- this eliminates the combined_id drift problem
-      where the wrong wall segment was retrieved and its endpoint used as the
-      facade origin.
-
-    FIX 3 (x_ref branching):
-      x_in is always the LEFT EDGE of the panel measured from wall visual start.
-      x_ref controls where the family origin sits along the panel width:
-        "start"  -> origin at left edge  -> place at x_ft + 0         (left-origin family)
-        "center" -> origin at center     -> place at x_ft + half_w_ft (center-origin family)
-        "end"    -> origin at right edge -> place at x_ft + width_ft  (right-origin family)
-      Previously only center was ever used, making Force End (Right) a no-op.
-
-    Depth / wall_normal still require the live Revit element (compound
-    structure analysis).  vis_left is used only as a fallback when CSV
-    geometry columns are absent (old CSV files).
-    """
-    # ------- 1. Retrieve Revit geometry (needed for depth axis only) -------
-    vis_left, vis_right, wall_dir_revit, wall_normal, core_center_off = get_wall_geometry_normalized(wall)
-
-    # ------- 2. Read CSV panel fields -------
-    x_in     = _safe_float(panel.get("x_in",     0.0))
-    y_in     = _safe_float(panel.get("y_in",     0.0))
+def compute_panel_base_point(wall, panel, extra_z_offset_in=0.0):
+    # Retrieve explicitly defined coordinates from CSV
+    x_in = _safe_float(panel.get("x_in", 0.0))
+    y_in = _safe_float(panel.get("y_in", 0.0))
     width_in = _safe_float(panel.get("width_in", 0.0))
-    x_ref    = (panel.get("x_ref", PANEL_COORD_DEFAULT_REF) or PANEL_COORD_DEFAULT_REF).lower().strip()
-
-    if X_REF_OVERRIDE == "start": x_ref = "start"
-    if X_REF_OVERRIDE == "end":   x_ref = "end"
-
-    x_ft      = _feet(x_in)
-    y_ft      = _feet(y_in)
-    half_w_ft = _feet(width_in / 2.0)
-    full_w_ft = _feet(width_in)
-
-    # ------- 3. Family origin offset along wall direction -------
-    # x_in is always the panel LEFT EDGE from the CSV wall origin.
-    # This family is center-origin along width, so place the insertion point
-    # at the panel center. Rotation may flip orientation, but must not move
-    # the panel center.
-    x_along = x_ft + half_w_ft
-
-    # ------- 4. FIX 2: use CSV wall origin/direction when available -------
-    ox, ox_ok = _try_float_strict(panel.get("wall_origin_x"))
-    oy, oy_ok = _try_float_strict(panel.get("wall_origin_y"))
-    oz, oz_ok = _try_float_strict(panel.get("wall_origin_z"))
-    dx, dx_ok = _try_float_strict(panel.get("wall_dir_x"))
-    dy, dy_ok = _try_float_strict(panel.get("wall_dir_y"))
-    dz, dz_ok = _try_float_strict(panel.get("wall_dir_z"))
-
-    csv_geom_valid = all([ox_ok, oy_ok, oz_ok, dx_ok, dy_ok, dz_ok])
-
-    if csv_geom_valid:
-        csv_origin = XYZ(ox, oy, oz)
-        # Normalise direction (should already be unit, but guard against float drift)
-        mag = math.sqrt(dx*dx + dy*dy + dz*dz)
-        csv_dir = XYZ(dx/mag, dy/mag, dz/mag) if mag > 1e-9 else XYZ(dx, dy, dz)
-
-        # Walk from the CSV-baked facade origin in the CSV-baked direction
-        pt_xy        = csv_origin + (csv_dir * x_along)
-        curve_z      = oz            # wall base Z baked from Start(X,Y,Z) by panel_calculator
-        wall_dir_use = csv_dir
-        print("  [GEO] Using CSV wall geometry: origin=({0:.3f},{1:.3f},{2:.3f}) "
-              "dir=({3:.4f},{4:.4f},{5:.4f})".format(ox, oy, oz, dx, dy, dz))
-    else:
-        # Fallback: derive from Revit element (old CSVs without geometry columns)
-        pt_xy        = vis_left + (wall_dir_revit * x_along)
-        curve_z      = vis_left.Z
-        wall_dir_use = wall_dir_revit
-        print("  [GEO] CSV wall geometry missing -- falling back to Revit element.")
-
-    # ------- 5. Vertical (Z) placement -------
-    wall_base_z = get_wall_base_elevation(wall)  # for diagnostics only
-
-    try:
-        lvl_id = wall.get_Parameter(BuiltInParameter.WALL_BASE_CONSTRAINT).AsElementId()
-        lvl    = doc.GetElement(lvl_id)
-        lvl_name    = lvl.Name if lvl else "Unknown"
-        base_offset = wall.get_Parameter(BuiltInParameter.WALL_BASE_OFFSET).AsDouble()
-        print("  [ELEV] Wall base: Level='{0}' @ {1:.3f} ft + offset {2:.3f} ft = {3:.3f} ft".format(
-            lvl_name, lvl.Elevation if lvl else 0, base_offset, wall_base_z))
-    except:
-        print("  [ELEV] Wall base Z (level): {0:.3f} ft".format(wall_base_z))
-
-    if abs(wall_base_z - curve_z) > 0.01:
-        print("  [ELEV] NOTE: Level Z={0:.3f} ft vs Curve Z={1:.3f} ft "
-              "-- using Curve Z for panel placement.".format(wall_base_z, curve_z))
-
-    # Z = wall curve base + panel bottom offset (y_in) + any extra offset
-    base_z = curve_z + y_ft + _feet(extra_z_offset_in)
-    print("  [ELEV] Panel base Z: {0:.3f} ft (curve {1:.3f} + y_in {2:.3f} in)".format(
-        base_z, curve_z, y_in))
-
-    # ------- 6. Assemble final insertion point -------
+    x_along = _feet(x_in) + _feet(width_in / 2.0)
+    
+    ox = _safe_float(panel.get("wall_origin_x"))
+    oy = _safe_float(panel.get("wall_origin_y"))
+    oz = _safe_float(panel.get("wall_origin_z"))
+    dx = _safe_float(panel.get("wall_dir_x"))
+    dy = _safe_float(panel.get("wall_dir_y"))
+    dz = _safe_float(panel.get("wall_dir_z"))
+    nx = _safe_float(panel.get("wall_normal_x"))
+    ny = _safe_float(panel.get("wall_normal_y"))
+    
+    csv_origin = XYZ(ox, oy, oz)
+    csv_dir = XYZ(dx, dy, dz).Normalize() if XYZ(dx,dy,dz).GetLength() > 1e-9 else XYZ(1,0,0)
+    wall_normal = XYZ(nx, ny, 0.0).Normalize() if XYZ(nx,ny,0).GetLength() > 1e-9 else XYZ(0,1,0)
+    
+    pt_xy = csv_origin + (csv_dir * x_along)
+    
+    # Simple Z calculation
+    base_z = oz + _feet(y_in) + _feet(extra_z_offset_in)
     base_point_loc = XYZ(pt_xy.X, pt_xy.Y, base_z)
-
-    calculated_offset  = core_center_off
-    calculated_offset += _feet(MANUAL_DEPTH_OFFSET_IN)
-
-    final_point = base_point_loc + (wall_normal * calculated_offset)
-    return final_point, wall_dir_use, wall_normal
+    
+    # Rely purely on MANUAL_DEPTH_OFFSET_IN (default 0.0)
+    calculated_offset = _feet(MANUAL_DEPTH_OFFSET_IN)
+    
+    if FAMILY_ORIGIN_LOCATION == "Front":
+        calculated_offset += _feet(PANEL_THICKNESS_IN) / 2.0
+    elif FAMILY_ORIGIN_LOCATION == "Back":
+        calculated_offset -= _feet(PANEL_THICKNESS_IN) / 2.0
+        
+    return base_point_loc + (wall_normal * calculated_offset), csv_dir, wall_normal
 
 def _dump_param_names(inst):
     if "_PARAM_DUMP_DONE" not in globals():
@@ -472,9 +286,7 @@ def _set_param(inst, param_name, value, label=""):
         return False
 
 def _set_first_found(inst, candidates, value, label=""):
-    """[FIX] Try each name in candidates; set the first writable one found.
-    Used for parameters like 'Void 1 X Offset Left' that have multiple historical names.
-    """
+    """Try each name in candidates; set the first writable one found."""
     for name in candidates:
         p = _resolve_param(inst, name)
         if p is not None and not p.IsReadOnly:
@@ -509,7 +321,8 @@ def set_void_parameters_for_cutouts(inst, panel_data):
     cutouts    = panel_data.get("cutouts", [])
     num        = len(cutouts)
     min_ft     = _feet(MIN_VOID_DIMENSION_IN)
-    panel_w_ft = _feet(_safe_float(panel_data.get("width_in",  120)))
+    panel_w_in = _safe_float(panel_data.get("width_in",  120))
+    panel_w_ft = _feet(panel_w_in)
     panel_h_ft = _feet(_safe_float(panel_data.get("height_in", 120)))
 
     print("  [VOID] Panel '{0}': {1} cutout(s)".format(
@@ -520,11 +333,15 @@ def set_void_parameters_for_cutouts(inst, panel_data):
         c = cutouts[0]
         unit_w_in   = max(_safe_float(c.get("raw_width_in",  c.get("width_in",  0))), MIN_VOID_DIMENSION_IN)
         unit_h_in   = max(_safe_float(c.get("raw_height_in", c.get("height_in", 0))), MIN_VOID_DIMENSION_IN)
-        x_offset_in = _safe_float(c.get("raw_x_in", c.get("x_in", 0)))
+        
+        raw_x_in    = _safe_float(c.get("raw_x_in", c.get("x_in", 0)))
+        # MIRROR THE X OFFSET: panel is rotated 180 deg, so family's internal "Left" is physical "Right"
+        x_offset_in = max(0.0, panel_w_in - unit_w_in - raw_x_in)
+        
         y_offset_in = _safe_float(c.get("raw_y_in", c.get("y_in", 0)))
         jamb_clr_in, head_clr_in, sill_clr_in = _get_clearances(c)
 
-        print("  [VOID1] ON | {0:.2f}x{1:.2f}in @ ({2:.2f},{3:.2f})in | clr J={4} H={5} S={6}".format(
+        print("  [VOID1] ON | {0:.2f}x{1:.2f}in @ (Mirrored X={2:.2f},{3:.2f})in | clr J={4} H={5} S={6}".format(
             unit_w_in, unit_h_in, x_offset_in, y_offset_in, jamb_clr_in, head_clr_in, sill_clr_in))
 
         _set_param(inst, V1_VISIBLE,     1,                   "VOID 1")
@@ -533,7 +350,6 @@ def set_void_parameters_for_cutouts(inst, panel_data):
         _set_param(inst, V1_JAMB_CLR,    _feet(jamb_clr_in),  "VOID 1 JAMB CLR")
         _set_param(inst, V1_HEAD_CLR,    _feet(head_clr_in),  "VOID 1 HEAD CLR")
         _set_param(inst, V1_SILL_CLR,    _feet(sill_clr_in),  "VOID 1 SILL CLR")
-        # [FIX] Use _set_first_found for X offset — tries "Void 1 X Offset Left" first
         _set_first_found(inst, V1_X_OFFSET_CANDIDATES, _feet(x_offset_in), "Void 1 X Offset Left")
         _set_param(inst, V1_Y_OFFSET,    _feet(y_offset_in),  "Void 1 Y Offset")
 
@@ -553,11 +369,15 @@ def set_void_parameters_for_cutouts(inst, panel_data):
         c2 = cutouts[1]
         unit_w2_in   = max(_safe_float(c2.get("raw_width_in",  c2.get("width_in",  0))), MIN_VOID_DIMENSION_IN)
         unit_h2_in   = max(_safe_float(c2.get("raw_height_in", c2.get("height_in", 0))), MIN_VOID_DIMENSION_IN)
-        x2_offset_in = _safe_float(c2.get("raw_x_in", c2.get("x_in", 0)))
+        
+        raw_x2_in    = _safe_float(c2.get("raw_x_in", c2.get("x_in", 0)))
+        # MIRROR THE X OFFSET: panel is rotated 180 deg, so family's internal "Left" is physical "Right"
+        x2_offset_in = max(0.0, panel_w_in - unit_w2_in - raw_x2_in)
+        
         y2_offset_in = _safe_float(c2.get("raw_y_in", c2.get("y_in", 0)))
         jamb2_clr_in, head2_clr_in, sill2_clr_in = _get_clearances(c2)
 
-        print("  [VOID2] ON | {0:.2f}x{1:.2f}in @ ({2:.2f},{3:.2f})in | clr J={4} H={5} S={6}".format(
+        print("  [VOID2] ON | {0:.2f}x{1:.2f}in @ (Mirrored X={2:.2f},{3:.2f})in | clr J={4} H={5} S={6}".format(
             unit_w2_in, unit_h2_in, x2_offset_in, y2_offset_in, jamb2_clr_in, head2_clr_in, sill2_clr_in))
 
         _set_param(inst, V2_VISIBLE,     1,                    "VOID 2")
@@ -566,7 +386,6 @@ def set_void_parameters_for_cutouts(inst, panel_data):
         _set_param(inst, V2_JAMB_CLR,    _feet(jamb2_clr_in),  "VOID 2 JAMB CLR")
         _set_param(inst, V2_HEAD_CLR,    _feet(head2_clr_in),  "VOID 2 HEAD CLR")
         _set_param(inst, V2_SILL_CLR,    _feet(sill2_clr_in),  "VOID 2 SILL CLR")
-        # [FIX] Use _set_first_found for X offset — tries "Void 2 X Offset Left" first
         _set_first_found(inst, V2_X_OFFSET_CANDIDATES, _feet(x2_offset_in), "Void 2 X Offset Left")
         _set_param(inst, V2_Y_OFFSET,    _feet(y2_offset_in),  "Void 2 Y Offset")
 
@@ -585,7 +404,7 @@ def set_void_parameters_for_cutouts(inst, panel_data):
         print("  [VOID] WARNING: {0} cutouts but family supports only 2. "
               "Cutouts beyond index 1 ignored.".format(num))
 
-
+              
 # ========== PLACEMENT ==========
 
 def _bbox_projection_span(bb, direction):
@@ -614,12 +433,6 @@ def _get_csv_origin_and_dir(panel, fallback_wall=None):
         mag = math.sqrt(dx*dx + dy*dy + dz*dz)
         if mag > 1e-9:
             return XYZ(ox, oy, oz), XYZ(dx/mag, dy/mag, dz/mag)
-    if fallback_wall:
-        try:
-            vis_left, vis_right, wall_dir_revit, wall_normal, core_center_off = get_wall_geometry_normalized(fallback_wall)
-            return vis_left, wall_dir_revit
-        except:
-            pass
     return None, None
 
 def _panel_solid_span_along_dir(inst, direction):
@@ -666,7 +479,6 @@ def _panel_solid_span_along_dir(inst, direction):
         return None, None
     return min(vals), max(vals)
 
-
 def align_instance_bbox_to_csv_span(inst, wall, panel):
     """Snap the panel's ACTUAL visible left edge to the CSV target left edge.
     Family-origin-agnostic, rotation-safe. Measures the real solid, not the
@@ -709,115 +521,70 @@ def align_instance_bbox_to_csv_span(inst, wall, panel):
         print("  [ALIGN] skipped/failed for {0}: {1}".format(panel.get("panel_name", "?"), e))
     return False
 
-def _face_panel_outward(inst, panel):
-    """Rotate inst about vertical Z so its FacingOrientation matches the wall
-    exterior normal from the CSV. Width axis then runs along the wall
-    automatically (family frame is rigid). Family-origin-agnostic, works on
-    every facade including non-orthogonal. No-op if normal missing."""
+def apply_csv_rotation(inst, panel):
+    """Pure mathematical rotation based on the CSV vectors, flipped 180 to face sheathing out."""
+    dx = _safe_float(panel.get("wall_dir_x", 0.0))
+    dy = _safe_float(panel.get("wall_dir_y", 0.0))
+    if abs(dx) < 1e-9 and abs(dy) < 1e-9: return
     
-    nx, nx_ok = _try_float_strict(panel.get("wall_normal_x"))
-    ny, ny_ok = _try_float_strict(panel.get("wall_normal_y"))
-    if not (nx_ok and ny_ok):
-        return
-
-    target = XYZ(nx, ny, 0.0)
-    if target.GetLength() < 1e-9:
-        return
-    target = target.Normalize()
-
-    doc.Regenerate()  # FacingOrientation valid only after regen
-
-    try:
-        facing = inst.FacingOrientation
-    except:
-        return
-
-    facing = XYZ(facing.X, facing.Y, 0.0)
-    if facing.GetLength() < 1e-9:
-        return
-    facing = facing.Normalize()
-
-    dot   = max(-1.0, min(1.0, facing.DotProduct(target)))
-    cross = facing.X * target.Y - facing.Y * target.X  # z of facing x target
-    angle = math.atan2(cross, dot)  # signed, about +Z
-
-    if abs(angle) < 1e-6:
-        return
-
-    pt   = inst.Location.Point
-    axis = Line.CreateBound(pt, pt + XYZ(0, 0, 10))
-
-    try:
-        ElementTransformUtils.RotateElement(doc, inst.Id, axis, angle)
-    except:
-        return
-
-    doc.Regenerate()
-
-    # Orientation override logic
-    if ROTATION_OVERRIDE_DEG is not None:
-        if abs(ROTATION_OVERRIDE_DEG) > 0.001:
-            try:
-                axis = Line.CreateBound(pt, pt + XYZ(0, 0, 10))
-                ElementTransformUtils.RotateElement(
-                    doc, inst.Id, axis, math.radians(ROTATION_OVERRIDE_DEG)
-                )
-            except:
-                pass
-    else:
-        _face_panel_outward(inst, panel)
+    # Add math.pi (180 degrees) so the family's -Y (Sheathing) points to the wall's Exterior Normal
+    target_angle = math.atan2(dy, dx) + math.pi
+    loc = inst.Location
+    
+    if hasattr(loc, "Rotation"):
+        current_angle = loc.Rotation
+        angle_to_rotate = target_angle - current_angle
+        
+        while angle_to_rotate > math.pi: angle_to_rotate -= 2 * math.pi
+        while angle_to_rotate <= -math.pi: angle_to_rotate += 2 * math.pi
+        
+        if abs(angle_to_rotate) > 1e-5:
+            doc.Regenerate()
+            axis = Line.CreateBound(loc.Point, loc.Point + XYZ(0, 0, 10))
+            ElementTransformUtils.RotateElement(doc, inst.Id, axis, angle_to_rotate)
+            print("  [ROTATION] Aligned X-axis & Flipped 180 to {:.2f} deg".format(math.degrees(target_angle)))
 
 
 def place_panel_family(wall, panel, symbol, extra_z_offset_in=0.0, is_cutout=False):
     if not ensure_symbol_active(symbol):
         return None
 
-    rot_deg = 0.0
-    if ROTATION_OVERRIDE_DEG is not None:
-        rot_deg = ROTATION_OVERRIDE_DEG
-    elif USE_CSV_ROTATION:
-        try: rot_deg = _safe_float(panel.get("rotation_deg", 0.0))
-        except: pass
-
     try:
-        pt, w_dir, w_norm = compute_panel_base_point(wall, panel, rot_deg, extra_z_offset_in)
+        pt, w_dir, w_norm = compute_panel_base_point(wall, panel, extra_z_offset_in)
     except Exception as e:
         print("[ERROR] Geometry calc failed for {0}: {1}".format(panel.get("panel_name", "?"), e))
         return None
 
     inst = None
+    
+    # FORCE UNHOSTED PLACEMENT
+    # By tying the family to the Level instead of the Wall, we stop Revit from 
+    # auto-flipping the axes based on the wall's drawing direction.
     try:
-        inst = doc.Create.NewFamilyInstance(pt, symbol, wall, StructuralType.NonStructural)
-        if extra_z_offset_in == 0:
-            print("  [PLACE] Hosted (abs Z={0:.3f} ft): {1}".format(
-                pt.Z, panel.get("panel_name", "")))
-    except:
-        pass
-
-    if not inst:
-        try:
-            lvl = get_wall_base_level(wall)
-            if lvl:
-                lvl_elev = lvl.Elevation
-                pt_rel   = XYZ(pt.X, pt.Y, pt.Z - lvl_elev)
-                inst = doc.Create.NewFamilyInstance(pt_rel, symbol, lvl, StructuralType.NonStructural)
-                print("  [PLACE] Non-hosted (level-relative Z={0:.3f} ft): {1}".format(
-                    pt_rel.Z, panel.get("panel_name", "")))
-            else:
-                inst = doc.Create.NewFamilyInstance(pt, symbol, StructuralType.NonStructural)
-                print("  [PLACE] Non-hosted (no level): {0}".format(panel.get("panel_name", "")))
-        except Exception as e:
-            print("[ERROR] Placement failed for {0}: {1}".format(panel.get("panel_name", "?"), e))
-            return None
+        lvl = get_wall_base_level(wall)
+        if lvl:
+            pt_rel = XYZ(pt.X, pt.Y, pt.Z - lvl.Elevation)
+            inst = doc.Create.NewFamilyInstance(pt_rel, symbol, lvl, StructuralType.NonStructural)
+            if extra_z_offset_in == 0:
+                print("  [PLACE] Level-hosted (Z={0:.3f} ft): {1}".format(pt_rel.Z, panel.get("panel_name", "")))
+        else:
+            inst = doc.Create.NewFamilyInstance(pt, symbol, StructuralType.NonStructural)
+            if extra_z_offset_in == 0:
+                print("  [PLACE] Free-hosted (no level): {0}".format(panel.get("panel_name", "")))
+    except Exception as e:
+        print("[ERROR] Placement failed for {0}: {1}".format(panel.get("panel_name", "?"), e))
+        return None
 
     doc.Regenerate()
 
-    if abs(rot_deg) > 0.001:
-        try:
-            axis = Line.CreateBound(pt, pt + XYZ(0, 0, 10))
-            ElementTransformUtils.RotateElement(doc, inst.Id, axis, math.radians(rot_deg))
-        except:
-            pass
+    if ROTATION_OVERRIDE_DEG is not None:
+        if abs(ROTATION_OVERRIDE_DEG) > 0.001:
+            try:
+                axis = Line.CreateBound(pt, pt + XYZ(0, 0, 10))
+                ElementTransformUtils.RotateElement(doc, inst.Id, axis, math.radians(ROTATION_OVERRIDE_DEG))
+            except: pass
+    else:
+        apply_csv_rotation(inst, panel)
 
     try:
         w_in = _safe_float(panel.get("width_in",  0))
@@ -830,8 +597,7 @@ def place_panel_family(wall, panel, symbol, extra_z_offset_in=0.0, is_cutout=Fal
         else:
             print("  [WARN] Zero/missing size for {0}".format(panel.get("panel_name", "?")))
     except Exception as e:
-        print("  [WARN] set_size_parameters/alignment failed for {0}: {1}".format(
-            panel.get("panel_name", "?"), e))
+        print("  [WARN] Size/alignment failed for {0}: {1}".format(panel.get("panel_name", "?"), e))
 
     if not is_cutout:
         set_void_parameters_for_cutouts(inst, panel)
@@ -841,11 +607,9 @@ def place_panel_family(wall, panel, symbol, extra_z_offset_in=0.0, is_cutout=Fal
         p = _find_param_by_candidates(inst, ["Name", "Panel Name", "Mark"])
         if p and not p.IsReadOnly:
             p.Set(panel.get("panel_name", ""))
-    except:
-        pass
+    except: pass
 
     return inst
-
 
 # ========== STANDARD HELPERS ==========
 
