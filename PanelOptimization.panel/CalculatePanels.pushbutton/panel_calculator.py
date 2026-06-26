@@ -164,30 +164,22 @@ class PanelConstraints(object):
 class OptimizationStrategy(object):
     def __init__(self, prioritize_coverage=True, allow_vertical_stacking=True,
                  prefer_full_height_panels=True, fill_above_storefronts=True,
-                 panel_orientation="vertical",
-                 minimize_unique_panels=False, cutout_tolerance=0.0,
-                 opening_alignment="opening_derived", void1_x_offset_left=6.0,
-                 nonwindow_strategy="largest"):
+                 panel_orientation="vertical", minimize_unique_panels=False, 
+                 use_ga_optimizer=False,
+                 cutout_tolerance=0.0, opening_alignment="opening_derived", 
+                 void1_x_offset_left=6.0, nonwindow_strategy="largest"):
+        
         self.prioritize_coverage       = bool(prioritize_coverage)
         self.allow_vertical_stacking   = bool(allow_vertical_stacking)
         self.prefer_full_height_panels = bool(prefer_full_height_panels)
         self.fill_above_storefronts    = bool(fill_above_storefronts)
         self.panel_orientation         = str(panel_orientation)
         self.minimize_unique_panels    = bool(minimize_unique_panels)
+        self.use_ga_optimizer          = bool(use_ga_optimizer)
         self.cutout_tolerance          = float(cutout_tolerance)
-        # Sub-strategy for panels WITH openings (only when minimize_unique_panels):
-        #   "opening_derived" — W = window_spacing - panel_spacing + window_width
-        #                       (Opening-Derived Width: largest identical panel)
-        #   "center"          — opening centred in panel: Void 1 X Offset Left = (W-c)/2
-        #   "set_x_offset"    — user sets Void 1 X Offset Left manually
-        self.opening_alignment   = str(opening_alignment)
-        # Used when opening_alignment == "set_x_offset":
-        # Void 1 X Offset Left = distance from panel left to opening left edge (inches)
-        self.void1_x_offset_left = float(void1_x_offset_left)
-        # Sub-strategy for panels WITHOUT openings:
-        #   "largest"      — largest panel that fits (default)
-        #   "standardise"  — match standard window-panel width W
-        self.nonwindow_strategy  = str(nonwindow_strategy)
+        self.opening_alignment         = str(opening_alignment)
+        self.void1_x_offset_left       = float(void1_x_offset_left)
+        self.nonwindow_strategy        = str(nonwindow_strategy)
 
 class OptimizerConfig(object):
     def __init__(self, project_name="Default Project", panel_constraints=None,
@@ -199,7 +191,6 @@ class OptimizerConfig(object):
         self.door_clearances = door_clearances or OpeningClearances()
         self.window_clearances = window_clearances or OpeningClearances()
         self.storefront_clearances = storefront_clearances or OpeningClearances()
-        # Wall openings (pure structural voids) — zero clearance by default
         self.wall_opening_clearances = wall_opening_clearances or OpeningClearances(
             rough_jamb=0.0, rough_header=0.0, rough_sill=0.0,
             panel_jamb=0.0, panel_header=0.0, panel_sill=0.0
@@ -207,7 +198,6 @@ class OptimizerConfig(object):
         self.optimization_strategy = optimization_strategy or OptimizationStrategy()
 
     def to_dict(self):
-        """Serialize configuration to dictionary with two-fold clearance structure."""
         pc  = self.panel_constraints
         dc  = self.door_clearances
         wc  = self.window_clearances
@@ -218,46 +208,26 @@ class OptimizerConfig(object):
         return {
             "project_name": self.project_name,
             "panel_constraints": {
-                "min_width": pc.min_width,
-                "max_width": pc.max_width,
-                "min_height": pc.min_height,
-                "max_height": pc.max_height,
-                "short_max": pc.short_max,
-                "long_max": pc.long_max,
-                "dimension_increment": pc.dimension_increment,
-                "panel_spacing": pc.panel_spacing
+                "min_width": pc.min_width, "max_width": pc.max_width,
+                "min_height": pc.min_height, "max_height": pc.max_height,
+                "short_max": pc.short_max, "long_max": pc.long_max,
+                "dimension_increment": pc.dimension_increment, "panel_spacing": pc.panel_spacing
             },
             "door_clearances": {
-                "rough_jamb": dc.rough_jamb,
-                "rough_header": dc.rough_header,
-                "rough_sill": dc.rough_sill,
-                "panel_jamb": dc.panel_jamb,
-                "panel_header": dc.panel_header,
-                "panel_sill": dc.panel_sill
+                "rough_jamb": dc.rough_jamb, "rough_header": dc.rough_header, "rough_sill": dc.rough_sill,
+                "panel_jamb": dc.panel_jamb, "panel_header": dc.panel_header, "panel_sill": dc.panel_sill
             },
             "window_clearances": {
-                "rough_jamb": wc.rough_jamb,
-                "rough_header": wc.rough_header,
-                "rough_sill": wc.rough_sill,
-                "panel_jamb": wc.panel_jamb,
-                "panel_header": wc.panel_header,
-                "panel_sill": wc.panel_sill
+                "rough_jamb": wc.rough_jamb, "rough_header": wc.rough_header, "rough_sill": wc.rough_sill,
+                "panel_jamb": wc.panel_jamb, "panel_header": wc.panel_header, "panel_sill": wc.panel_sill
             },
             "storefront_clearances": {
-                "rough_jamb": sc.rough_jamb,
-                "rough_header": sc.rough_header,
-                "rough_sill": sc.rough_sill,
-                "panel_jamb": sc.panel_jamb,
-                "panel_header": sc.panel_header,
-                "panel_sill": sc.panel_sill
+                "rough_jamb": sc.rough_jamb, "rough_header": sc.rough_header, "rough_sill": sc.rough_sill,
+                "panel_jamb": sc.panel_jamb, "panel_header": sc.panel_header, "panel_sill": sc.panel_sill
             },
             "wall_opening_clearances": {
-                "rough_jamb": woc.rough_jamb,
-                "rough_header": woc.rough_header,
-                "rough_sill": woc.rough_sill,
-                "panel_jamb": woc.panel_jamb,
-                "panel_header": woc.panel_header,
-                "panel_sill": woc.panel_sill
+                "rough_jamb": woc.rough_jamb, "rough_header": woc.rough_header, "rough_sill": woc.rough_sill,
+                "panel_jamb": woc.panel_jamb, "panel_header": woc.panel_header, "panel_sill": woc.panel_sill
             },
             "optimization_strategy": {
                 "prioritize_coverage": os.prioritize_coverage,
@@ -266,6 +236,7 @@ class OptimizerConfig(object):
                 "fill_above_storefronts": os.fill_above_storefronts,
                 "panel_orientation": os.panel_orientation,
                 "minimize_unique_panels": os.minimize_unique_panels,
+                "use_ga_optimizer": getattr(os, "use_ga_optimizer", False),
                 "cutout_tolerance": os.cutout_tolerance,
                 "opening_alignment": os.opening_alignment,
                 "void1_x_offset_left": os.void1_x_offset_left,
@@ -281,76 +252,53 @@ class OptimizerConfig(object):
         sc  = data.get("storefront_clearances", {})
         woc = data.get("wall_opening_clearances", {})
         os_ = data.get("optimization_strategy", {})
+        
         return cls(
             project_name=data.get("project_name", "Default Project"),
             panel_constraints=PanelConstraints(
                 pc.get("min_width", 24.0), pc.get("max_width", 348.0),
                 pc.get("min_height", 24.0), pc.get("max_height", 144.0),
                 pc.get("short_max", 138), pc.get("long_max", 348.0),
-                pc.get("dimension_increment", 1.0),
-                pc.get("panel_spacing", 0.125)
+                pc.get("dimension_increment", 1.0), pc.get("panel_spacing", 0.125)
             ),
             door_clearances=OpeningClearances(
-                rough_jamb=dc.get("rough_jamb", 1.0),
-                rough_header=dc.get("rough_header", 2.0),
-                rough_sill=dc.get("rough_sill", 0.0),
-                panel_jamb=dc.get("panel_jamb", 5.0),
-                panel_header=dc.get("panel_header", 6.0),
-                panel_sill=dc.get("panel_sill", 0.0)
+                rough_jamb=dc.get("rough_jamb", 1.0), rough_header=dc.get("rough_header", 2.0), rough_sill=dc.get("rough_sill", 0.0),
+                panel_jamb=dc.get("panel_jamb", 5.0), panel_header=dc.get("panel_header", 6.0), panel_sill=dc.get("panel_sill", 0.0)
             ),
             window_clearances=OpeningClearances(
-                rough_jamb=wc.get("rough_jamb", 0.5),
-                rough_header=wc.get("rough_header", 0.5),
-                rough_sill=wc.get("rough_sill", 0.5),
-                panel_jamb=wc.get("panel_jamb", 5.5),
-                panel_header=wc.get("panel_header", 7.5),
-                panel_sill=wc.get("panel_sill", 5.5)
+                rough_jamb=wc.get("rough_jamb", 0.5), rough_header=wc.get("rough_header", 0.5), rough_sill=wc.get("rough_sill", 0.5),
+                panel_jamb=wc.panel_jamb, panel_header=wc.get("panel_header", 7.5), panel_sill=wc.get("panel_sill", 5.5)
             ),
             storefront_clearances=OpeningClearances(
-                rough_jamb=sc.get("rough_jamb", 0.5),
-                rough_header=sc.get("rough_header", 0.5),
-                rough_sill=sc.get("rough_sill", 0.0),
-                panel_jamb=sc.get("panel_jamb", 5.5),
-                panel_header=sc.get("panel_header", 7.5),
-                panel_sill=sc.get("panel_sill", 0.0)
+                rough_jamb=sc.get("rough_jamb", 0.5), rough_header=sc.get("rough_header", 0.5), rough_sill=sc.get("rough_sill", 0.0),
+                panel_jamb=sc.get("panel_jamb", 5.5), panel_header=sc.get("panel_header", 7.5), panel_sill=sc.get("panel_sill", 0.0)
             ),
-            # Wall openings (pure voids) — zero clearance by default, backward compatible
             wall_opening_clearances=OpeningClearances(
-                rough_jamb=woc.get("rough_jamb", 0.0),
-                rough_header=woc.get("rough_header", 0.0),
-                rough_sill=woc.get("rough_sill", 0.0),
-                panel_jamb=woc.get("panel_jamb", 0.0),
-                panel_header=woc.get("panel_header", 0.0),
-                panel_sill=woc.get("panel_sill", 0.0)
+                rough_jamb=woc.get("rough_jamb", 0.0), rough_header=woc.get("rough_header", 0.0), rough_sill=woc.get("rough_sill", 0.0),
+                panel_jamb=woc.get("panel_jamb", 0.0), panel_header=woc.get("panel_header", 0.0), panel_sill=woc.get("panel_sill", 0.0)
             ),
             optimization_strategy=OptimizationStrategy(
-                os_.get("prioritize_coverage", True),
-                os_.get("allow_vertical_stacking", True),
-                os_.get("prefer_full_height_panels", True),
-                os_.get("fill_above_storefronts", True),
-                os_.get("panel_orientation", "vertical"),
-                os_.get("minimize_unique_panels", False),
-                os_.get("cutout_tolerance", 0.0),
-                # backward compat: old "as_placed" -> "opening_derived"
-                os_.get("opening_alignment", "opening_derived").replace(
-                    "as_placed", "opening_derived").replace(
-                    "fixed_offset", "set_x_offset"),
-                os_.get("void1_x_offset_left",
-                    os_.get("fixed_offset_in", 6.0)),  # old field name fallback
-                os_.get("nonwindow_strategy", "largest")
+                prioritize_coverage=os_.get("prioritize_coverage", True),
+                allow_vertical_stacking=os_.get("allow_vertical_stacking", True),
+                prefer_full_height_panels=os_.get("prefer_full_height_panels", True),
+                fill_above_storefronts=os_.get("fill_above_storefronts", True),
+                panel_orientation=os_.get("panel_orientation", "vertical"),
+                minimize_unique_panels=os_.get("minimize_unique_panels", False),
+                use_ga_optimizer=os_.get("use_ga_optimizer", False),
+                cutout_tolerance=os_.get("cutout_tolerance", 0.0),
+                opening_alignment=os_.get("opening_alignment", "opening_derived").replace("as_placed", "opening_derived").replace("fixed_offset", "set_x_offset"),
+                void1_x_offset_left=os_.get("void1_x_offset_left", os_.get("fixed_offset_in", 6.0)),
+                nonwindow_strategy=os_.get("nonwindow_strategy", "largest")
             )
         )
-
 
     def save(self, filepath):
         try:
             f = io.open(filepath, "w", newline="")
         except TypeError:
             f = open(filepath, "w")
-
         with f:
             json.dump(self.to_dict(), f, indent=2)
-
         print("{} Config saved: {}{}".format(Ansi.GREEN, filepath, Ansi.RESET))
 
     @classmethod
@@ -358,7 +306,6 @@ class OptimizerConfig(object):
         with open(filepath, "r") as f:
             data = json.load(f)
         return cls.from_dict(data)
-
 
 def get_preset_configs():
     _woc_zero = OpeningClearances(
@@ -385,7 +332,12 @@ def get_preset_configs():
             panel_jamb=5.5, panel_header=7.5, panel_sill=0.0
         ),
         wall_opening_clearances=_woc_zero,
-        optimization_strategy=OptimizationStrategy(True, True, True, True, "vertical")
+        optimization_strategy=OptimizationStrategy(
+            prioritize_coverage=True, allow_vertical_stacking=True,
+            prefer_full_height_panels=True, fill_above_storefronts=True,
+            panel_orientation="vertical", minimize_unique_panels=False,
+            use_ga_optimizer=False
+        )
     )
     presets["horizontal"] = OptimizerConfig(
         project_name="Horizontal Panels",
@@ -406,7 +358,12 @@ def get_preset_configs():
             panel_jamb=5.5, panel_header=7.5, panel_sill=0.0
         ),
         wall_opening_clearances=_woc_zero,
-        optimization_strategy=OptimizationStrategy(False, True, False, True, "horizontal")
+        optimization_strategy=OptimizationStrategy(
+            prioritize_coverage=False, allow_vertical_stacking=True,
+            prefer_full_height_panels=False, fill_above_storefronts=True,
+            panel_orientation="horizontal", minimize_unique_panels=False,
+            use_ga_optimizer=False
+        )
     )
     return presets
 
@@ -628,7 +585,42 @@ def adjust_panels_for_small_openings(panels, openings, constraints, dim_inc):
             right.x = float(new_right_x)
             right.w = float(new_right_fab_w)
             break
+def evaluate_manufacturing_score(panels, constraints):
+    """
+    Calculates the DfMA manufacturing score for a given panel layout.
+    Lower is better.
+    """
+    if not panels:
+        return (9999, 9999, {"panels": 0, "unique": 0})
 
+    total_panels = len(panels)
+    
+    # Calculate Unique Panel Types (Fabrication complexity)
+    unique_signatures = set()
+    for p in panels:
+        # Round dimensions to 1/8" to group panels with microscopic floating-point differences
+        sig_w = round(p.w * 8.0) / 8.0
+        sig_h = round(p.h * 8.0) / 8.0
+        
+        # Cutout signature (A panel with a hole is fabricated differently than a solid one)
+        cutouts = []
+        for c in getattr(p, 'cutouts', []):
+            cutouts.append((round(c['width_in'], 1), round(c['height_in'], 1)))
+        cutouts.sort()
+        
+        unique_signatures.add((sig_w, sig_h, tuple(cutouts)))
+        
+    unique_types = len(unique_signatures)
+
+    # --- NEW SCORING HIERARCHY ---
+    # Score = Total Panels + (Unique Types * User Weight)
+    primary_score = total_panels + (unique_types * weight)
+    
+    # Tie-breaker is the Total Panels
+    tie_breaker = total_panels
+    
+    return (primary_score, tie_breaker, {"panels": total_panels, "unique": unique_types})
+    
 
 # =============================================================================
 # SECTION 3: COLLISION DETECTION
@@ -694,7 +686,16 @@ def is_blocking_storefront(opening, constraints):
     return opening.force_blocker
 
 def is_cutout_opening(opening, constraints):
-    return not opening.force_blocker
+    # Ensure Storefronts are included as cutouts
+    valid_types = ["Window", "Door", "Storefront", "Curtain", "Opening"]
+    
+    # Safely get the type string whether the attribute is named 'type' or 'type_name'
+    op_type = getattr(opening, 'type_name', getattr(opening, 'type', ''))
+    
+    # Check if the opening type matches our valid list
+    is_valid_type = any(t in op_type for t in valid_types)
+    
+    return is_valid_type and not opening.force_blocker
 
 def panel_overlaps_clearance(panel, openings, constraints, allow_intentional=False):
     p_right = panel.x + panel.w
@@ -798,14 +799,45 @@ def fill_vertical_gap(region_x_start, region_x_end, gap_y_start, gap_y_end,
 
 def calculate_segment_layout(start_x, target_x, max_w, min_w, inc, spacing):
     total_dist = target_x - start_x
-    if total_dist < min_w: return total_dist
-    if total_dist <= max_w: return snap_down(total_dist, inc)
     
+    if total_dist < min_w: 
+        return total_dist
+        
+    if total_dist <= max_w: 
+        return snap_down(total_dist, inc)
+    
+    # FIX: Check if taking the maximum greedy width leaves a tiny "splinter" panel
+    leftover = total_dist - max_w - spacing
+    if 0 < leftover < min_w:
+        # Splinter alert! 
+        # Instead of max_w, split the remaining distance equally to generate 
+        # two identically-sized standard panels that are larger than min_w.
+        half_width = (total_dist - spacing) / 2.0
+        return snap_down(half_width, inc)
+        
     # GREEDY: Place largest possible panel first
     return snap_down(max_w, inc)
 
-
 def place_panels_sequential(wall_width, wall_height, openings, constraints, orientation="vertical"):
+    """
+    Middleware Wrapper: Intercepts constraints before handing them to the greedy engine.
+    If Horizontal Mode is active, it safely swaps the 10-foot max_width ceiling 
+    for the massive long_max ceiling, allowing the engine to swallow entire blank walls.
+    """
+    import copy
+    
+    # Create a local copy so we don't permanently overwrite the user's global config
+    active_constraints = copy.copy(constraints)
+    
+    if str(orientation).lower() == "horizontal":
+        # Unlock the massive width limit for horizontal panel generation!
+        active_constraints.max_width = constraints.long_max
+        
+    # Pass the unlocked constraints into your original, untouched logic
+    return _core_place_panels_sequential(wall_width, wall_height, openings, active_constraints, orientation)
+
+
+def _core_place_panels_sequential(wall_width, wall_height, openings, constraints, orientation="vertical"):
     """
     Fixed panel placement with Lookahead Logic + Seam Validation.
     """
@@ -889,42 +921,31 @@ def place_panels_sequential(wall_width, wall_height, openings, constraints, orie
             while x_cursor < region['x_end']:
                 remaining_wall = region['x_end'] - x_cursor
 
-                # [FIX] If the remaining strip is below min_width but > 0, we cannot
-                # place a new panel there. Instead, widen the LAST placed panel in this
-                # band to absorb the remainder, provided:
-                #   a) there IS a previous panel in this band
-                #   b) widening it stays within max_width_for_band
-                # This prevents uncovered end-strips like the 23.5" gap on a 714" wall
-                # where 5×138" + 4×0.125" = 690.5" leaves 23.5" < min_width=24".
+                # [FIX] Widen last panel to absorb end-of-wall remainders
                 if remaining_wall > 0 and remaining_wall < PANEL_WIDTH_MIN:
                     band_panels = [p for p in panels if abs(p.y - y_start) < 0.01]
                     if band_panels:
                         last = band_panels[-1]
                         extended_w = round(last.w + spacing + remaining_wall, 8)
                         if extended_w <= max_width_for_band:
-                            # Widen last panel to cover the remainder (absorb spacing+remainder)
                             last.w = extended_w
                             last.cutouts = calculate_panel_cutouts(last, region_openings)
-                            print("    [FIX] Widened {} from {:.3f}\" to {:.3f}\" to absorb {:.3f}\" end remainder".format(
-                                last.name, extended_w - spacing - remaining_wall, extended_w, remaining_wall))
+                            print("    [FIX] Widened {} to {:.3f}\" to absorb remainder".format(last.name, extended_w))
                         else:
-                            # Can't widen — place a sub-min end panel using EXACT remaining width
-                            # (no snap_down) so the panel physically reaches the wall end.
                             snap_w = round(remaining_wall, 8)
-                            candidate = Panel(x_cursor, y_start, snap_w, band_height,
-                                             "P{:02d}".format(panel_counter))
+                            candidate = Panel(x_cursor, y_start, snap_w, band_height, "P{:02d}".format(panel_counter))
                             candidate.cutouts = calculate_panel_cutouts(candidate, region_openings)
                             panels.append(candidate)
                             panel_counter += 1
-                            print("    [FIX] Placed narrow end panel {:.3f}\" (below min_width={:.0f}\")".format(
-                                snap_w, PANEL_WIDTH_MIN))
+                            print("    [FIX] Placed narrow end panel {:.3f}\"".format(snap_w))
                     break
 
                 if remaining_wall < PANEL_WIDTH_MIN: break
 
+                # --- FIX: Prevent swallowing Storefronts/Doors ---
                 future_openings = [
                     o for o in region_openings
-                    if (o.left_clearance_zone > x_cursor + 0.01)
+                    if (o.right_clearance_zone > x_cursor + 0.01)
                     and not (o.top_clearance_zone <= y_start or o.bottom_clearance_zone >= y_end)
                     and not is_cutout_opening(o, constraints)
                 ]
@@ -957,6 +978,8 @@ def place_panels_sequential(wall_width, wall_height, openings, constraints, orie
 
                 panel_w = calculate_segment_layout(x_cursor, hard_stop_x, max_width_for_band, PANEL_WIDTH_MIN, DIMENSION_INCREMENT, spacing)
                 candidate_right = x_cursor + panel_w
+                
+                # Check for jamb clashes and adjust
                 for op in region_openings:
                     if (op.left_clearance_zone + 0.1) < candidate_right < (op.right_clearance_zone - 0.1):
                         dist_to_left_jamb = op.left_clearance_zone - x_cursor
@@ -983,14 +1006,10 @@ def place_panels_sequential(wall_width, wall_height, openings, constraints, orie
                 if target_is_opening and abs(x_cursor - (hard_stop_x + spacing)) < 1.0:
                     x_cursor = next_opening.right_clearance_zone
 
-        # FILL VERTICAL GAPS (above/below non-storefront blockers only)
-        # Storefronts are handled separately in the EXTRA section below,
-        # which uses the storefront's own x-span as boundaries.
-        # Including them here would cause double-filling.
+        # FILL VERTICAL GAPS
         gap_openings = [o for o in region_openings if not is_cutout_opening(o, constraints)
                         and not is_storefront_like(o)]
         for opening in gap_openings:
-            # Skip openings that span the full wall height (nothing to fill)
             if opening.bottom_clearance_zone <= 0 and opening.top_clearance_zone >= wall_height:
                 continue
 
@@ -1014,7 +1033,7 @@ def place_panels_sequential(wall_width, wall_height, openings, constraints, orie
                         opening.left_clearance_zone, opening.right_clearance_zone,
                         panels, panel_counter, constraints, sorted_openings,
                         "above",
-                        False  # not storefront — use opening x bounds
+                        False
                     )
 
         region_panels = [p for p in panels if (region['x_start'] <= p.x < region['x_end'])]
@@ -1038,7 +1057,7 @@ def place_panels_sequential(wall_width, wall_height, openings, constraints, orie
                 )
                 extra_filled += len(panels) - before_count
         
-        # [NEW] Fill BELOW
+        # Fill BELOW
         if sf.bottom_clearance_zone > 0:
             gap_height = sf.bottom_clearance_zone - 0
             if gap_height >= PANEL_HEIGHT_MIN:
@@ -1055,7 +1074,49 @@ def place_panels_sequential(wall_width, wall_height, openings, constraints, orie
 
     return panels
 
+    
+def _place_ga_optimized(wall_width, wall_height, openings, constraints, orientation, strategy):
+    """
+    Placement engine for the Genetic Algorithm strategy.
+    Runs the GA to find the optimal sequence, then converts that sequence 
+    into physical Panel objects that respect your opening clearances.
+    """
+    print(Ansi.MAGENTA + "  [GA] Solving for optimal layout using GA sequence..." + Ansi.RESET)
+    
+    # 1. Run the GA to get the "Winning Chromosome" 
+    # FIX: Remove 'openings' and add 'strategy' to match the new solve_with_ga definition
+    best_sequence = solve_with_ga(wall_width, constraints, strategy)
+    
+    panels = []
+    panel_counter = 1
+    x_cursor = 0.0
+    spacing = constraints.panel_spacing
+    
+    # 2. Convert the GA widths into Panel objects
+    for w in best_sequence:
+        # Safety check: stop if the GA sequence is longer than the wall
+        if x_cursor + w > wall_width:
+            break
+            
+        # Create the panel
+        p = Panel(x_cursor, 0, w, wall_height, "PGA{:02d}".format(panel_counter))
+        
+        # 3. Calculate cutouts (this uses your existing clearance/opening logic)
+        # This ensures that even though the GA chose the width, the cutouts
+        # remain correctly positioned relative to the window openings.
+        p.cutouts = calculate_panel_cutouts(p, openings)
+        
+        panels.append(p)
+        panel_counter += 1
+        x_cursor += (w + spacing)
+        
+    print(Ansi.GREEN + "  [GA] Successfully placed {} GA-optimized panels."
+          .format(len(panels)) + Ansi.RESET)
+        
+    return panels
 
+
+    
 def calculate_panel_cutouts(panel, openings):
     cutouts = []
     p_left = panel.x
@@ -1064,7 +1125,16 @@ def calculate_panel_cutouts(panel, openings):
     p_top = panel.y + panel.h
 
     for opening in openings:
-        if opening.force_blocker: continue
+        # --- FIX 1: Partial string matching for "Storefront/Curtain" ---
+        # Look for the type safely. Use getattr in case your object uses 'type' instead of 'type_name'
+        op_type = getattr(opening, 'type_name', getattr(opening, 'type', ''))
+        is_cutout = any(term in op_type for term in ["Window", "Door", "Storefront", "Curtain", "Opening"])
+        
+        # --- FIX 2: Override force_blocker for valid cutouts ---
+        # If it's not a valid cutout AND it's a blocker, we skip it.
+        # Otherwise, we proceed to check for physical intersections.
+        if not is_cutout and opening.force_blocker: 
+            continue
 
         hole_left = opening.x - opening.clearances.rough_jamb
         hole_right = opening.x + opening.w + opening.clearances.rough_jamb
@@ -1076,7 +1146,8 @@ def calculate_panel_cutouts(panel, openings):
         inter_bottom = max(p_bottom, hole_bottom)
         inter_top = min(p_top, hole_top)
 
-        if inter_right > inter_left and inter_top > inter_bottom:
+        # If there is a physical overlap between the panel and the hole
+        if inter_right > inter_left and inter_top > inter_bottom and is_cutout:
             cutout_x = inter_left   - p_left
             cutout_y = inter_bottom - p_bottom
             cutout_w = inter_right  - inter_left
@@ -1109,6 +1180,78 @@ def calculate_panel_cutouts(panel, openings):
     cutouts.sort(key=lambda c: (-c["y_in"], c["x_in"]))
     return cutouts
 
+
+def solve_with_ga(zone_len, constraints, strategy):
+    import random
+    
+    POP_SIZE = 50
+    # Bumped slightly to give the GA time to find the right length
+    GENERATIONS = 50 
+    MUTATION_RATE = 0.3
+    
+    min_w = int(constraints.min_width)
+    max_w = int(constraints.max_width)
+    inc = int(constraints.dimension_increment)
+    
+    if min_w >= max_w: max_w = min_w + inc
+        
+    valid_widths = list(range(min_w, max_w + inc, inc))
+    if not valid_widths: valid_widths = [min_w]
+
+    # Read the dynamic weight from the UI (defaults to 10.0 if not found)
+    user_weight = getattr(strategy, 'unique_weight', 10.0)
+
+    def fitness(chromosome):
+        total_panels = len(chromosome)
+        unique_types = len(set(chromosome))
+        
+        length_penalty = abs(zone_len - sum(chromosome)) * 100.0 
+        
+        # --- NEW DYNAMIC FITNESS ---
+        # Evaluates exactly based on the user's UI input
+        score = (unique_types * user_weight) + total_panels + length_penalty
+        
+        return score
+
+    # 1. Generate initial population with length variance
+    population = []
+    for _ in range(POP_SIZE):
+        guess_w = random.choice(valid_widths)
+        num_panels = max(1, int(zone_len // guess_w))
+        population.append([random.choice(valid_widths) for _ in range(num_panels)])
+
+    for gen in range(GENERATIONS):
+        population.sort(key=fitness)
+        next_gen = population[:10] # Elitism
+        
+        while len(next_gen) < POP_SIZE:
+            parent1, parent2 = random.sample(population[:20], 2)
+            
+            # Crossover (Safely handles parents of different lengths)
+            split1 = len(parent1) // 2
+            split2 = len(parent2) // 2
+            child = parent1[:split1] + parent2[split2:]
+            
+            # 2. Dynamic Mutation: Allow adding, removing, or modifying panels
+            if random.random() < MUTATION_RATE and child:
+                mut_type = random.choice(["modify", "add", "remove"])
+                
+                if mut_type == "modify":
+                    idx = random.randint(0, len(child)-1)
+                    child[idx] = random.choice(valid_widths)
+                
+                elif mut_type == "add":
+                    child.insert(random.randint(0, len(child)), random.choice(valid_widths))
+                
+                elif mut_type == "remove" and len(child) > 1:
+                    child.pop(random.randint(0, len(child)-1))
+                    
+            next_gen.append(child)
+        population = next_gen
+
+    population.sort(key=fitness)
+    return population[0] # Return the best sequence
+
 def _cutout_fingerprint(cutout):
     """
     Exact hashable fingerprint for one cutout using raw opening dimensions.
@@ -1133,56 +1276,90 @@ def _opening_size_key(cutout):
 def _panel_type_key(panel, alignment):
     """
     Hashable key for grouping panels into fabrication types.
-
-    "as_placed"    — (width, height, exact cutout fingerprints including x/y position)
-    "center"       — (width, height, opening size only — x position is derived)
-    "fixed_offset" — (width, height, opening size only — x position is derived)
-
-    For center/fixed_offset, two panels with the same width and opening size
-    will be given the SAME key, allowing the alignment step to canonicalise them
-    to a shared position even if the original x offsets differ slightly.
+    UPDATED: Includes Mirror-Symmetry detection. Left-offset and 
+    Right-offset equivalents will now group as the exact same type.
     """
     bw = round(float(panel.w), 4)
     bh = round(float(panel.h), 4)
 
     if alignment == "as_placed":
-        cut_keys = tuple(sorted(
+        # 1. Standard orientation cuts
+        cuts = sorted(
             [_cutout_fingerprint(c) for c in panel.cutouts],
             key=lambda t: (-t[1], t[0])
-        ))
+        )
+        
+        # 2. Mirrored orientation cuts (Flipped across panel width)
+        mirrored_cuts = []
+        for c in panel.cutouts:
+            w = round(float(c.get("raw_width_in", c.get("width_in", 0))), 4)
+            x = round(float(c.get("raw_x_in", c.get("x_in", 0))), 4)
+            y = round(float(c.get("raw_y_in", c.get("y_in", 0))), 4)
+            h = round(float(c.get("raw_height_in", c.get("height_in", 0))), 4)
+            
+            # The mathematical mirror: (Panel Width) - (Cutout X) - (Cutout Width)
+            mirrored_x = round(bw - x - w, 4)
+            mirrored_cuts.append((mirrored_x, y, w, h))
+            
+        mirrored_cuts = sorted(mirrored_cuts, key=lambda t: (-t[1], t[0]))
+        
+        # 3. Canonical Selection: Whichever tuple evaluates as smaller becomes the universal ID.
+        # This forces a left-heavy panel and a right-heavy panel to share the exact same key.
+        cut_keys = tuple(min(cuts, mirrored_cuts))
+        
     else:
-        # Group by opening SIZE only; position will be normalised below
+        # Group by opening SIZE only (center / set_x_offset alignment handles position later)
         cut_keys = tuple(sorted(
             [_opening_size_key(c) for c in panel.cutouts],
             key=lambda t: (-t[1], t[0])
         ))
+        
     return (bw, bh, cut_keys)
 
 
-def normalize_panel_types(panels, alignment="as_placed", fixed_offset_in=6.0,
-                          constraints=None):
-    import copy as _copy
+def normalize_panel_types(panels, alignment, fixed_offset_in, constraints):
     """
-    Group panels into shared fabrication types and optionally re-position the
-    opening within every panel in a group so all instances are truly identical.
-
-    alignment:
-      "as_placed"    — group only panels whose dimensions AND cutout x/y already
-                       match exactly.  No positions are changed.
-      "center"       — group panels with same width and opening size; shift the
-                       panel's x on the wall so the opening is horizontally
-                       centred inside the panel (panel_left = opening_center - w/2).
-      "fixed_offset" — group panels with same width and opening size; shift the
-                       panel's x on the wall so the opening left edge is always
-                       fixed_offset_in from the panel left edge.
-
-    For center/fixed_offset the panel's wall position (panel.x) is adjusted so
-    all instances share the identical void x offset.  Gaps between adjacent
-    panels may become slightly uneven, but coverage is maintained.
-    Constraints are respected: the shifted panel must stay within [0, wall_width].
+    Groups panels by identical geometries and assigns Type labels (T01, T02).
+    Now recognizes Left-Hand and Right-Hand mirrored panels as the exact same Type!
     """
-    if not panels:
-        return panels
+    unique_types = {}
+    type_counter = 1
+
+    for p in panels:
+        sig_w = round(p.w * 8.0) / 8.0
+        sig_h = round(p.h * 8.0) / 8.0
+
+        std_cutouts = []
+        mir_cutouts = []
+
+        for c in getattr(p, 'cutouts', []):
+            cx = round(c['x_in'], 2)
+            cy = round(c['y_in'], 2)
+            cw = round(c['width_in'], 2)
+            ch = round(c['height_in'], 2)
+
+            std_cutouts.append((cx, cy, cw, ch))
+
+            # Simulate the panel being flipped to group LH/RH twins
+            mir_x = round(p.w - c['x_in'] - c['width_in'], 2)
+            mir_cutouts.append((mir_x, cy, cw, ch))
+
+        std_cutouts.sort()
+        mir_cutouts.sort()
+
+        std_sig = (sig_w, sig_h, tuple(std_cutouts))
+        mir_sig = (sig_w, sig_h, tuple(mir_cutouts))
+
+        # Always take the mathematically smaller signature so mirrors snap to the same ID
+        canonical_sig = min(std_sig, mir_sig)
+
+        if canonical_sig not in unique_types:
+            unique_types[canonical_sig] = "T{:02d}".format(type_counter)
+            type_counter += 1
+
+        p.name = unique_types[canonical_sig]
+
+    return panels
 
     dim_inc = constraints.dimension_increment if constraints else 1.0
     min_w   = constraints.min_width           if constraints else 24.0
@@ -1350,36 +1527,25 @@ def detect_repeating_opening_groups(openings, constraints):
 
 def compute_opening_derived_width(opening, window_spacing, constraints):
     """
-    Opening-Derived Width strategy.
-
-    Given a repeating window pattern with known center-to-center spacing:
-        W = window_spacing - panel_spacing + window_width
-           (= e - d + c  from the design diagram)
-
-    This produces the LARGEST possible identical panel for the repeating zone.
-    Void 1 X Offset Left and Void 1 X Offset Right are derived automatically:
-        Void 1 X Offset Left  = first_opening.left_edge - zone_seam
-        Void 1 X Offset Right = W - c - Void_1_X_Offset_Left
-
-    Returns (W, void1_x_offset_left) or (None, None) if constraints cannot be met.
+    TILING MODULE STRATEGY:
+    Finds the exact mathematical width to maintain perfect grid sync with windows.
     """
-    d   = constraints.panel_spacing
-    c   = opening.w
-    W   = window_spacing - d + c
-
-    inc     = constraints.dimension_increment
-    W_snapped = round(round(W / inc) * inc, 8)
-
-    if W_snapped < constraints.min_width:
-        return None, None
-    if W_snapped > min(constraints.short_max, constraints.long_max):
-        # Cap at max and still use it — offsets will be asymmetric but valid
-        W_snapped = snap_down(min(constraints.short_max, constraints.long_max), inc)
-
-    # Void 1 X Offset Left: the window is positioned as far left as possible
-    # (or symmetrically) — the code will override with canonical value later.
-    # Return W only; caller computes left offset from seam geometry.
-    return W_snapped, None
+    d = constraints.panel_spacing
+    max_w = min(constraints.short_max, constraints.long_max)
+    
+    n_panels = 1
+    while n_panels < 10:
+        W_exact = (window_spacing / n_panels) - d
+        
+        # FIX: Do not use snap_down here. Snapping destroys the mathematical 
+        # period of the grid, causing panels to slowly drift away from the windows.
+        if constraints.min_width <= W_exact <= max_w:
+            optimum_left_jamb = opening.clearances.jamb_min
+            return W_exact, optimum_left_jamb
+            
+        n_panels += 1
+        
+    return None, None
 
 
 def find_standard_panel_width(opening, window_zone_length, constraints):
@@ -1560,22 +1726,78 @@ def process_wall(wall_id, wall_width, wall_height, openings):
     strategy    = ACTIVE_CONFIG.optimization_strategy
     constraints = ACTIVE_CONFIG.panel_constraints
 
-    # ── Decide placement approach ─────────────────────────────────────────
-    if strategy.minimize_unique_panels:
-        panels = _place_minimize_unique(
-            wall_width, wall_height, openings, constraints, orientation, strategy)
+    # =================================================================
+    # FIX: Safely initialize panels so it physically cannot be Unbound
+    # =================================================================
+    panels = []
+
+
+    # --- CLEAN BRANCHING LOGIC WITH TOURNAMENT ---
+    if getattr(strategy, 'best_to_manufacture', False):
+        print(Ansi.MAGENTA + "  [TOURNAMENT] Evaluating strategies for Wall {}...".format(wall_id) + Ansi.RESET)
+        
+        # Fetch user weight
+        u_weight = getattr(strategy, 'unique_weight', 10.0)
+        
+        # Run 1: Minimize Total Panels
+        panels_largest = place_panels_sequential(wall_width, wall_height, openings, constraints, orientation)
+        score_largest = evaluate_manufacturing_score(panels_largest, constraints, u_weight)
+        
+        # Run 2: Minimize Unique
+        panels_min = _place_minimize_unique(wall_width, wall_height, openings, constraints, orientation, strategy)
+        score_min = evaluate_manufacturing_score(panels_min, constraints, u_weight)
+        
+        # Run 3: Genetic Algorithm
+        panels_ga = _place_ga_optimized(wall_width, wall_height, openings, constraints, orientation, strategy)
+        score_ga = evaluate_manufacturing_score(panels_ga, constraints, u_weight)
+
+        
+        # Group and sort results
+        tournament = [
+            ("Minimize Total Panels", panels_largest, score_largest),
+            ("Minimize Unique", panels_min, score_min),
+            ("Genetic Algorithm", panels_ga, score_ga)
+        ]
+        
+        # Sort: Primary Score (Total + Unique), then Tie-breaker (Total Panels)
+        tournament.sort(key=lambda x: (x[2][0], x[2][1]))
+        
+        # Print the Scoreboard
+        print(Ansi.CYAN + "    --- Scoreboard ---" + Ansi.RESET)
+        for rank, (name, p_list, score) in enumerate(tournament, start=1):
+            print("    {}. {}: Score {} ({} panels, {} unique)".format(
+                rank, name.ljust(22), score[0], score[2]['panels'], score[2]['unique']
+            ))
+        
+        winner_name, winner_panels, winner_score = tournament[0]
+        print(Ansi.GREEN + "  [WINNER] {} takes the wall!".format(winner_name) + Ansi.RESET)
+        
+        # Assign winning list to our safe variable
+        panels = winner_panels
+
+    elif getattr(strategy, 'use_ga_optimizer', False):
+        print(Ansi.MAGENTA + "  [EXECUTE] Running Genetic Algorithm..." + Ansi.RESET)
+        panels = _place_ga_optimized(wall_width, wall_height, openings, constraints, orientation, strategy)
+        
+    elif getattr(strategy, 'minimize_unique_panels', False):
+        print(Ansi.MAGENTA + "  [EXECUTE] Running Minimize Unique..." + Ansi.RESET)
+        panels = _place_minimize_unique(wall_width, wall_height, openings, constraints, orientation, strategy)
+        
     else:
-        panels = place_panels_sequential(
-            wall_width, wall_height, openings, constraints, orientation)
+        # =================================================================
+        # FIX: The hard 'else' guarantees this runs if nothing else does
+        # =================================================================
+        print(Ansi.MAGENTA + "  [EXECUTE] Running Minimize Total Panels..." + Ansi.RESET)
+        panels = place_panels_sequential(wall_width, wall_height, openings, constraints, orientation)
 
     # ── Assign type labels ────────────────────────────────────────────────
-    if strategy.minimize_unique_panels:
+    if getattr(strategy, 'best_to_manufacture', False) or getattr(strategy, 'minimize_unique_panels', False) or getattr(strategy, 'use_ga_optimizer', False):
         print(Ansi.CYAN + "  [TYPES] Running panel type grouping "
-              "(alignment={})...".format(strategy.opening_alignment) + Ansi.RESET)
+              "(alignment={})...".format(getattr(strategy, 'opening_alignment', 'center')) + Ansi.RESET)
         panels = normalize_panel_types(
             panels,
-            alignment=strategy.opening_alignment,
-            fixed_offset_in=strategy.void1_x_offset_left,
+            alignment=getattr(strategy, 'opening_alignment', 'center'),
+            fixed_offset_in=getattr(strategy, 'void1_x_offset_left', 6.0),
             constraints=constraints
         )
 
@@ -1592,232 +1814,239 @@ def process_wall(wall_id, wall_width, wall_height, openings):
             "area_in2":     panel.w * panel.h,
             "rotation_deg": 0.0,
             "x_ref":        "start",
-            "cutouts_json": json.dumps(panel.cutouts) if panel.cutouts else ""
+            "cutouts_json": json.dumps(panel.cutouts) if getattr(panel, 'cutouts', None) else ""
         })
 
     print(Ansi.GREEN + " Result: {} panels generated".format(len(panels)) + Ansi.RESET)
     return records
 
-
 def _place_minimize_unique(wall_width, wall_height, openings, constraints,
                             orientation, strategy):
     """
-    Placement pass for the Minimize Unique Panels strategy.
-
-    For each group of regularly-spaced identical openings:
-      1. Compute the window zone [first_clr_left, last_clr_right].
-      2. Find the standard panel width W with the most repetitions.
-      3. Place N identical standard panels covering the zone.
-      4. Fill left edge and right edge with largest-possible panels.
-
-    Falls back to place_panels_sequential for zones where no valid W exists.
+    Placement pass for the Minimize Unique strategy using Anchored Tiling.
+    Maximizes panel width by swallowing multiple windows per panel to reduce 
+    total panels, while strictly anchoring cutouts to standardize fabrication types.
     """
-    # Classify openings first so force_blocker flags are set
-    classify_openings_dynamic(openings, constraints)
+    import math
 
+    orientation = str(orientation or "vertical").lower()
+    horizontal_mode = (orientation == "horizontal")
+
+    # --- Generate Horizontal Bands ---
+    def get_y_bands(total_h):
+        if not horizontal_mode: return [(0, total_h)]
+        bands = []
+        cy = 0
+        inc = constraints.dimension_increment
+        short_max = constraints.short_max
+        while cy < total_h:
+            rem_h = total_h - cy
+            max_h_allow = min(rem_h, short_max)
+            bh = math.floor(max_h_allow / inc) * inc
+            if bh < constraints.min_height:
+                if bands: bands[-1] = (bands[-1][0], total_h)
+                else: bands.append((0, total_h))
+                break
+            bands.append((cy, cy + bh))
+            cy += bh
+        return bands
+
+    wall_bands = get_y_bands(wall_height)
+
+    # 1. Classify openings 
+    classify_openings_dynamic(openings, constraints)
     repeating_groups = detect_repeating_opening_groups(openings, constraints)
 
     if not repeating_groups:
-        # No repeating patterns — fall back to normal algorithm
         print(Ansi.YELLOW + "  [PATTERN] No repeating groups found — "
-              "using largest-panel-possible." + Ansi.RESET)
-        return place_panels_sequential(
-            wall_width, wall_height, openings, constraints, orientation)
+              "using Minimize Total Panels fallback." + Ansi.RESET)
+        return place_panels_sequential(wall_width, wall_height, openings, constraints, orientation)
 
     panels        = []
     panel_counter = 1
     covered_zones = []
-    standard_w    = None
 
-    # ── Merge groups that share the same horizontal zone ─────────────────
-    # L1 and L2 windows often occupy the same x-span but different sill heights.
-    # We want ONE standard panel spanning the full wall height with TWO cutouts,
-    # not two separate panel strips stacked on top of each other.
-    # Merge groups whose zones overlap horizontally into a single "combined group".
+    def _zone_of(grp): return grp[0].left_clearance_zone, grp[-1].right_clearance_zone
 
-    def _zone_of(grp):
-        return grp[0].left_clearance_zone, grp[-1].right_clearance_zone
-
-    merged_groups = []  # list of (zone_start, zone_end, [opening, ...])
+    merged_groups = []
     for group in repeating_groups:
         zs, ze = _zone_of(group)
-        # Find an existing merged entry that overlaps this zone
         merged = None
         for m in merged_groups:
-            # Overlap = zones share at least 80% of the smaller zone
             overlap = min(ze, m[1]) - max(zs, m[0])
             smaller = min(ze - zs, m[1] - m[0])
             if overlap > 0.8 * smaller:
                 merged = m
                 break
         if merged is not None:
-            # Expand zone and add openings
             merged[2].extend(group)
             merged[0] = min(merged[0], zs)
             merged[1] = max(merged[1], ze)
         else:
             merged_groups.append([zs, ze, list(group)])
 
-    # Process each merged zone
-    for zone_entry in merged_groups:
-        zone_start, zone_end, zone_openings = zone_entry
-        zone_len  = zone_end - zone_start
-        primary_o = sorted(zone_openings, key=lambda o: o.x)[0]
+ # 3. Process each merged zone (MULTI-WINDOW ANCHORED GRID WITH LH/RH MEMORY)
+    memory_bank = {} # Stores: window_signature -> (standard_w, canonical_left)
+
+    for zone_start, zone_end, zone_openings in merged_groups:
+        primary_band = sorted(zone_openings, key=lambda o: o.x)
+        primary_o = primary_band[0]
 
         standard_w     = None
         canonical_left = None
         n_panels       = 0
 
-        # Opening-Derived Width
-        if strategy.opening_alignment == 'opening_derived':
-            primary_band = sorted(zone_openings, key=lambda o: o.x)
+        max_w_allowed = constraints.long_max if horizontal_mode else constraints.max_width
+        
+        # --- NEW: LH/RH Pattern Memory Recognition ---
+        # Generate a mathematical signature for this specific cluster of windows
+        band_w = primary_band[-1].x + primary_band[-1].w - primary_o.x
+        local_windows = tuple((round(w.x - primary_o.x, 2), round(w.w, 2)) for w in primary_band)
+        
+        # Generate what the reverse (mirrored) version of this cluster would look like
+        mirrored_windows = tuple((round(band_w - (w.x - primary_o.x) - w.w, 2), round(w.w, 2)) for w in reversed(primary_band))
+
+        if mirrored_windows in memory_bank:
+            # TWIN DETECTED! Pull the exact dimensions of its mirror and flip the anchor.
+            standard_w, orig_canonical_left = memory_bank[mirrored_windows]
+            canonical_left = standard_w - band_w - orig_canonical_left
+            print(Ansi.CYAN + "  [PATTERN] Mirrored LH/RH Twin Detected! Applying reversed anchor." + Ansi.RESET)
+            
+        else:
+            # Normal Calculation (No mirror found yet)
+            window_spacing = 0
             if len(primary_band) >= 2:
                 ctrs = [o.x + o.w / 2.0 for o in primary_band]
-                window_spacing = sum(
-                    ctrs[i+1] - ctrs[i] for i in range(len(ctrs)-1)
-                ) / (len(ctrs) - 1)
+                window_spacing = sum(ctrs[i+1] - ctrs[i] for i in range(len(ctrs)-1)) / (len(ctrs) - 1)
+
+            align_strat = getattr(strategy, 'opening_alignment', 'opening_derived')
+
+            if len(primary_band) == 1 or window_spacing < constraints.min_width:
+                standard_w = max_w_allowed
+                inc = constraints.dimension_increment
+                standard_w = math.floor(standard_w / inc) * inc
+                
+                if align_strat == 'center':
+                    canonical_left = (standard_w - primary_o.w) / 2.0
+                else:
+                    canonical_left = getattr(strategy, 'void1_x_offset_left', 6.0)
             else:
-                window_spacing = zone_len
-            W_derived, _ = compute_opening_derived_width(
-                primary_o, window_spacing, constraints)
-            if W_derived is not None:
-                c_left  = primary_o.x - zone_start
-                c_right = W_derived - primary_o.w - c_left
-                if c_left >= 0 and c_right >= 0:
-                    standard_w     = W_derived
-                    canonical_left = c_left
-                    n_panels = max(1, int(round(zone_len / standard_w)))
+                best_N = 1
+                for N in range(1, 50): 
+                    w_test = (N * window_spacing) - constraints.panel_spacing
+                    if w_test <= max_w_allowed:
+                        best_N = N
+                    else:
+                        break 
+                
+                standard_w = (best_N * window_spacing) - constraints.panel_spacing
+                
+                if align_strat == 'center':
+                    group_w = ((best_N - 1) * window_spacing) + primary_o.w
+                    canonical_left = (standard_w - group_w) / 2.0
+                elif align_strat == 'set_x_offset':
+                    canonical_left = getattr(strategy, 'void1_x_offset_left', 6.0)
+                else:
+                    canonical_left = primary_o.clearances.panel_jamb
 
-        # Center Openings
-        if standard_w is None and strategy.opening_alignment == 'center':
-            sw, nr = find_standard_panel_width(primary_o, zone_len, constraints)
-            if sw is not None:
-                standard_w     = sw
-                canonical_left = (sw - primary_o.w) / 2.0
-                n_panels       = nr
+            # Save this newly calculated layout to the memory bank for future mirroring!
+            if standard_w is not None:
+                memory_bank[local_windows] = (standard_w, canonical_left)
 
-        # Set X Offset
-        if standard_w is None and strategy.opening_alignment == 'set_x_offset':
-            sw, nr = find_standard_panel_width(primary_o, zone_len, constraints)
-            if sw is not None:
-                standard_w     = sw
-                canonical_left = max(0.0, min(strategy.void1_x_offset_left,
-                                              sw - primary_o.w))
-                n_panels       = nr
+        if standard_w is None or standard_w < constraints.min_width:
+            print(Ansi.YELLOW + '  [PATTERN] Skipping zone - math resolved below min width' + Ansi.RESET)
+            continue 
 
-        # Fallback for opening_derived
-        if standard_w is None and strategy.opening_alignment == 'opening_derived':
-            sw, nr = find_standard_panel_width(primary_o, zone_len, constraints)
-            if sw is not None:
-                standard_w     = sw
-                canonical_left = max(0.0, min(primary_o.x - zone_start,
-                                              sw - primary_o.w))
-                n_panels       = nr
+        # Anchor the Grid to the Window (Eliminates Snowflakes)
+        actual_zone_start = primary_o.x - canonical_left
+        if actual_zone_start < 0:
+            actual_zone_start = 0.0
 
-        # No valid W -- largest-possible fallback
-        if standard_w is None:
-            print(Ansi.YELLOW + '  [PATTERN] No standard width for zone'
-                  ' [{:.1f}, {:.1f}] -- largest-panel fallback.'.format(
-                  zone_start, zone_end) + Ansi.RESET)
-            zone_ops_local = [o for o in openings
-                              if o.left_clearance_zone >= zone_start - 0.01
-                              and o.right_clearance_zone <= zone_end + 0.01]
-            for o in zone_ops_local:
-                o.x -= zone_start
-            fallback = place_panels_sequential(
-                zone_end - zone_start, wall_height, zone_ops_local,
-                constraints, orientation)
-            for p in fallback:
-                p.x += zone_start
-            panels.extend(fallback)
-            panel_counter += len(fallback)
-            for o in zone_ops_local:
-                o.x += zone_start
-            covered_zones.append((zone_start, zone_end))
-            continue
+        last_o = primary_band[-1]
+        dist_to_cover = (last_o.x + last_o.w + canonical_left) - actual_zone_start
+        n_panels = max(1, int(math.ceil((dist_to_cover - 0.1) / (standard_w + constraints.panel_spacing))))
 
-        void1_right = standard_w - primary_o.w - canonical_left
-        print(Ansi.CYAN + ('  [PATTERN] W={:.4g}" N={} '
-              'Void1XOffsetLeft={:.3f}" Void1XOffsetRight={:.3f}" '
-              'zone=[{:.1f}", {:.1f}"] mode={}').format(
-            standard_w, n_panels, canonical_left, void1_right,
-            zone_start, zone_end, strategy.opening_alignment) + Ansi.RESET)
+        print(Ansi.CYAN + ('  [PATTERN] Multi-Window Tiling: W={:.4g}" N={} '
+              'start={:.1f}"').format(standard_w, n_panels, actual_zone_start) + Ansi.RESET)
 
-        rough_j = primary_o.clearances.rough_jamb
+        actual_zone_end = actual_zone_start
+
         for i in range(n_panels):
-            panel_x = round(zone_start + i * standard_w, 8)
-            p = Panel(panel_x, 0, standard_w, wall_height,
-                      'P{:02d}'.format(panel_counter))
-            panel_counter += 1
-            p.cutouts = calculate_panel_cutouts(p, openings)
-            for cut in p.cutouts:
-                cut['raw_x_in'] = round(float(canonical_left), 8)
-                cut['x_in']     = max(0.0, round(canonical_left - rough_j, 8))
-            panels.append(p)
+            panel_x = round(actual_zone_start + i * (standard_w + constraints.panel_spacing), 8)
+            actual_w = standard_w
+            if panel_x + actual_w > wall_width:
+                actual_w = wall_width - panel_x
+                if actual_w < constraints.min_width:
+                    break
+            
+            for y_s, y_e in wall_bands:
+                p = Panel(panel_x, y_s, actual_w, y_e - y_s, 'P{:02d}'.format(panel_counter))
+                panel_counter += 1
+                p.cutouts = calculate_panel_cutouts(p, openings)
+                panels.append(p)
+            
+            actual_zone_end = panel_x + actual_w + constraints.panel_spacing
 
-        covered_zones.append((zone_start, zone_end))
+        covered_zones.append((actual_zone_start, actual_zone_end))
 
-    # ── Fill uncovered regions with largest-possible panels ──────────────
-    # Build list of uncovered x-ranges
+    # 4. Fill uncovered regions (Solid Panels between Window Grids)
     covered_zones.sort(key=lambda z: z[0])
+    
+    merged_covered = []
+    if covered_zones:
+        curr_zs, curr_ze = covered_zones[0]
+        for next_zs, next_ze in covered_zones[1:]:
+            if next_zs <= curr_ze + 0.01: 
+                curr_ze = max(curr_ze, next_ze)
+            else:
+                merged_covered.append((curr_zs, curr_ze))
+                curr_zs, curr_ze = next_zs, next_ze
+        merged_covered.append((curr_zs, curr_ze))
+
     uncovered = []
     cursor = 0.0
-    for zs, ze in covered_zones:
-        if cursor < zs - 0.01:
+    for zs, ze in merged_covered:
+        if cursor < zs - 0.01: 
             uncovered.append((cursor, zs))
-        cursor = ze
+        cursor = max(cursor, ze)
+        
     if cursor < wall_width - 0.01:
         uncovered.append((cursor, wall_width))
 
     for u_start, u_end in uncovered:
         u_width = u_end - u_start
-        if u_width < constraints.min_width:
-            continue
-        # Openings that fall in this uncovered region
-        u_openings = [o for o in openings
-                      if not (o.right_clearance_zone <= u_start
-                              or o.left_clearance_zone >= u_end)]
-        # Shift openings to local coordinates
-        for o in u_openings:
-            o.x -= u_start
+        
+        # Widen adjacent solid panels to absorb any tiny leftover slivers
+        if u_width < constraints.min_width and panels:
+            adjacent_panels = [p for p in panels if abs((p.x + p.w) - u_start) < 0.1]
+            if adjacent_panels:
+                can_widen = True
+                max_w_allowed = constraints.long_max if horizontal_mode else constraints.max_width
+                for ap in adjacent_panels:
+                    if ap.w + u_width > max_w_allowed:
+                        can_widen = False
+                
+                if can_widen:
+                    for ap in adjacent_panels:
+                        ap.w += u_width
+                        ap.cutouts = calculate_panel_cutouts(ap, openings)
+                    continue
+        
+        u_openings = [o for o in openings if not (o.right_clearance_zone <= u_start or o.left_clearance_zone >= u_end)]
+        for o in u_openings: o.x -= u_start
 
-        if (strategy.nonwindow_strategy == "standardise"
-                and covered_zones and standard_w is not None):
-            # Try to use standard_w panels in this edge zone too
-            n_std = int(u_width // standard_w)
-            remainder = u_width - n_std * standard_w
-            for i in range(n_std):
-                p_x = u_start + i * standard_w
-                p = Panel(p_x, 0, standard_w, wall_height, "P{:02d}".format(panel_counter))
-                panel_counter += 1
-                p.cutouts = calculate_panel_cutouts(p, openings)
-                panels.append(p)
-            if remainder >= constraints.min_width:
-                p = Panel(u_start + n_std * standard_w, 0,
-                          snap_down(remainder, constraints.dimension_increment),
-                          wall_height, "P{:02d}".format(panel_counter))
-                panel_counter += 1
-                p.cutouts = calculate_panel_cutouts(p, openings)
-                panels.append(p)
-        else:
-            u_panels = place_panels_sequential(
-                u_width, wall_height, u_openings, constraints, orientation)
-            # Shift back to wall coordinates and renumber
-            for p in u_panels:
-                p.x += u_start
-                p.name = "P{:02d}".format(panel_counter)
-                panel_counter += 1
-            panels.extend(u_panels)
+        # Use Greedy logic to fill gaps with massive panels
+        u_panels = place_panels_sequential(u_width, wall_height, u_openings, constraints, orientation)
+        for p in u_panels:
+            p.x += u_start
+            p.name = "P{:02d}".format(panel_counter)
+            panel_counter += 1
+        panels.extend(u_panels)
+        
+        for o in u_openings: o.x += u_start
 
-        # Restore opening positions
-        for o in u_openings:
-            o.x += u_start
-
-    # Sort panels left to right and renumber sequentially
     panels.sort(key=lambda p: (p.y, p.x))
-    for idx, p in enumerate(panels, start=1):
-        p.name = "P{:02d}".format(idx)
-
+    for idx, p in enumerate(panels, start=1): p.name = "P{:02d}".format(idx)
     return panels
 
 
@@ -1831,6 +2060,11 @@ def process_all_walls(walls_rows, openings_rows, output_dir,
         ACTIVE_CONFIG = presets.get(orientation, presets["vertical"])
     
     all_panel_records = []
+    processed_endpoints = [] # Tracks corners for butt joints
+    
+    # Sort walls to process connected facades sequentially
+    walls_rows.sort(key=lambda w: (w.get("FacadeId", ""), safe_float(w.get("wall_origin_x")), safe_float(w.get("wall_origin_y"))))
+
     for wall_row in walls_rows:
         wall_id = get_wall_id(wall_row)
         dims = get_wall_dimensions(wall_row)
@@ -1838,8 +2072,11 @@ def process_all_walls(walls_rows, openings_rows, output_dir,
 
         wall_width, wall_height = dims
         wall_base_z = get_wall_base_z_ft(wall_row)
+        
+        # Extract thickness for butt joint calculation
+        panel_thick_in = safe_float(wall_row.get("panel_total_thickness_in"), 6.625)
 
-        # Always read clearances from ACTIVE_CONFIG so they stay in sync
+        # Always read clearances from ACTIVE_CONFIG
         active_door_cl         = ACTIVE_CONFIG.door_clearances
         active_window_cl       = ACTIVE_CONFIG.window_clearances
         active_storefront_cl   = ACTIVE_CONFIG.storefront_clearances
@@ -1851,10 +2088,7 @@ def process_all_walls(walls_rows, openings_rows, output_dir,
             active_wall_opening_cl,
             wall_base_z_ft=wall_base_z
         )
-        # [FIX] Embed the wall's visual-start and unit-direction vector into every
-        # panel record.  placement_script.py reads these columns and uses them as
-        # vis_left / wall_dir instead of re-deriving from a single Revit wall
-        # element (which may not be the leftmost segment of a combined facade).
+        
         _start_xyz = _parse_xyz(wall_row.get("Start(X,Y,Z)", ""))
         _end_xyz   = _parse_xyz(wall_row.get("End(X,Y,Z)",   ""))
         if _start_xyz and _end_xyz:
@@ -1862,179 +2096,83 @@ def process_all_walls(walls_rows, openings_rows, output_dir,
             _dy = _end_xyz[1] - _start_xyz[1]
             _dz = _end_xyz[2] - _start_xyz[2]
             _mag = math.sqrt(_dx*_dx + _dy*_dy + _dz*_dz)
-            if _mag > 1e-9:
-                _wall_geom = {
-                    "wall_origin_x": round(_start_xyz[0], 8),
-                    "wall_origin_y": round(_start_xyz[1], 8),
-                    "wall_origin_z": round(_start_xyz[2], 8),
-                    "wall_dir_x":   round(_dx / _mag, 8),
-                    "wall_dir_y":   round(_dy / _mag, 8),
-                    "wall_dir_z":   round(_dz / _mag, 8),
-                }
-            else:
-                _wall_geom = {
-                    "wall_origin_x": round(_start_xyz[0], 8),
-                    "wall_origin_y": round(_start_xyz[1], 8),
-                    "wall_origin_z": round(_start_xyz[2], 8),
-                    "wall_dir_x": 1.0, "wall_dir_y": 0.0, "wall_dir_z": 0.0,
-                }
-        else:
             _wall_geom = {
-                "wall_origin_x": 0.0, "wall_origin_y": 0.0, "wall_origin_z": 0.0,
-                "wall_dir_x": 1.0, "wall_dir_y": 0.0, "wall_dir_z": 0.0,
+                "wall_origin_x": round(_start_xyz[0], 8),
+                "wall_origin_y": round(_start_xyz[1], 8),
+                "wall_origin_z": round(_start_xyz[2], 8),
+                "wall_dir_x":   round(_dx / _mag, 8) if _mag > 1e-9 else 1.0,
+                "wall_dir_y":   round(_dy / _mag, 8) if _mag > 1e-9 else 0.0,
+                "wall_dir_z":   round(_dz / _mag, 8) if _mag > 1e-9 else 0.0,
             }
+        else:
+            _wall_geom = {"wall_origin_x": 0.0, "wall_origin_y": 0.0, "wall_origin_z": 0.0, "wall_dir_x": 1.0, "wall_dir_y": 0.0, "wall_dir_z": 0.0}
 
-        # ---- Corner extension & depth alignment --------------------------------
-        # PanelStartExt / PanelEndExt (exported by script.py): how many inches the
-        # panel layout should extend BEFORE wall_origin and AFTER wall_end to cover
-        # building corners.  wall_origin itself is kept at the Revit location-line
-        # endpoint so the placement script's ALIGN target is unaffected.
-        _p_start_ext = safe_float(wall_row.get("PanelStartExt(in)", 0.0))
-        _p_end_ext   = safe_float(wall_row.get("PanelEndExt(in)",   0.0))
+        # True Corner Detection (Butt Joints)
+        _p_start_ext = 0.0
+        _p_end_ext = 0.0
+        if _start_xyz and _end_xyz:
+            for p_pt, p_dir in processed_endpoints:
+                if math.sqrt((_start_xyz[0]-p_pt[0])**2 + (_start_xyz[1]-p_pt[1])**2 + (_start_xyz[2]-p_pt[2])**2) < 1.0: 
+                    if abs(_wall_geom["wall_dir_x"]*p_dir[0] + _wall_geom["wall_dir_y"]*p_dir[1] + _wall_geom["wall_dir_z"]*p_dir[2]) < 0.5:
+                        _p_start_ext = -panel_thick_in
+                        break
+            for p_pt, p_dir in processed_endpoints:
+                if math.sqrt((_end_xyz[0]-p_pt[0])**2 + (_end_xyz[1]-p_pt[1])**2 + (_end_xyz[2]-p_pt[2])**2) < 1.0:
+                    if abs(_wall_geom["wall_dir_x"]*p_dir[0] + _wall_geom["wall_dir_y"]*p_dir[1] + _wall_geom["wall_dir_z"]*p_dir[2]) < 0.5:
+                        _p_end_ext = -panel_thick_in
+                        break
+            current_dir = (_wall_geom["wall_dir_x"], _wall_geom["wall_dir_y"], _wall_geom["wall_dir_z"])
+            processed_endpoints.append((_start_xyz, current_dir))
+            processed_endpoints.append((_end_xyz, current_dir))
 
-        # Extend the effective wall width for panel generation.
         _eff_wall_w = wall_width + _p_start_ext + _p_end_ext
-
-        # Shift openings so their x_in values are relative to the EXTENDED start.
         import copy as _cp_ext
         _ext_openings = _cp_ext.deepcopy(openings)
-        for _eo in _ext_openings:
-            _eo.x += _p_start_ext
+        for _eo in _ext_openings: _eo.x += _p_start_ext
 
-        # ---- Depth correction ---------------------------------------------------
-        # The placement script expects wall_origin to be at the Revit wall's
-        # location-line depth — which for this wall configuration is at the WALL
-        # CENTRE (half the total wall thickness inward from the exterior face).
-        # When the location line is "Finish Face: Exterior", geo['start'] is at the
-        # exterior face (depth = 0).  Shift wall_origin half the wall thickness
-        # inward so the placement script's core-centre offset gives the right result:
-        #   exterior_face(0") + half_width(6.94") + core_offset(7.06") = 14" ✓
-        _loc_line_str  = str(wall_row.get("LocationLine", "")).lower()
-        _wall_thick_ft = safe_float(wall_row.get("Width(ft)", 0.0))
-
-        # [FIX] Parse wall normal from CSV before using it for depth correction.
-        # The exporter writes this as "Normal(unit XYZ)". If it is missing or
-        # invalid, _parse_xyz returns None and the depth shift is safely skipped.
-        _normal_xyz = _parse_xyz(wall_row.get("Normal(unit XYZ)", ""))
-
-        _is_finish_ext = (("finish" in _loc_line_str or "face" in _loc_line_str)
-                          and "exterior" in _loc_line_str
-                          and "core" not in _loc_line_str)
-
-        if _is_finish_ext and (_normal_xyz is not None) and _wall_thick_ft > 0:
-            _hw = _wall_thick_ft / 2.0           # half-thickness in feet
-            _wall_geom["wall_origin_x"] = round(_wall_geom["wall_origin_x"] - _normal_xyz[0] * _hw, 8)
-            _wall_geom["wall_origin_y"] = round(_wall_geom["wall_origin_y"] - _normal_xyz[1] * _hw, 8)
-            _wall_geom["wall_origin_z"] = round(_wall_geom["wall_origin_z"] - _normal_xyz[2] * _hw, 8)
-            print(Ansi.CYAN + "  [DEPTH] wall_origin shifted {:.3f} in to wall centre "
-                  "(Finish Face: Exterior → centred on structural core)".format(_hw * 12) + Ansi.RESET)
-        # -------------------------------------------------------------------------
-        # Splits the wall into horizontal bands at floor/level elevations.
-        # Uses the greedy algorithm (_compute_elevation_bands):
-        #   · max_ph >= story height → one band per story, snap to level
-        #   · max_ph < story height  → full-height (max_ph) + short fill band
-        #                              pair per story; no band ever exceeds max_ph
-        #   · max_ph spans N stories → single band covers multiple stories
-        #
-        # wall_height is already in inches (get_wall_dimensions converts ft→in).
-        _wall_h_in = wall_height
-        _base_z_in = wall_base_z * 12.0
-        _max_ph_in = ACTIVE_CONFIG.panel_constraints.max_height
-
-        try:
-            _lvl_abs_in = json.loads(wall_row.get("LevelElevations(in)", "[]"))
-        except Exception:
-            _lvl_abs_in = []
-
-        # Relative elevations from wall base, filtered to meaningful interior positions
-        _rel_elevs = sorted({
-            round(e - _base_z_in, 2)
-            for e in _lvl_abs_in
-            if 6.0 < (e - _base_z_in) < (_wall_h_in - 6.0)
-        })
-
+        # Elevation bands and process_wall loop
+        _wall_h_in, _base_z_in, _max_ph_in = wall_height, wall_base_z * 12.0, ACTIVE_CONFIG.panel_constraints.max_height
+        try: _lvl_abs_in = json.loads(wall_row.get("LevelElevations(in)", "[]"))
+        except: _lvl_abs_in = []
+        _rel_elevs = sorted({round(e - _base_z_in, 2) for e in _lvl_abs_in if 6.0 < (e - _base_z_in) < (_wall_h_in - 6.0)})
         _bands = _compute_elevation_bands(_wall_h_in, _rel_elevs, _max_ph_in)
 
-        if len(_bands) == 1:
-            # Single band — normal path, no overhead
-            panel_records = process_wall(wall_id, _eff_wall_w, wall_height, _ext_openings)
-        else:
-            print(Ansi.CYAN +
-                  "  [BANDS] {:.0f}\" tall wall → {} elevation bands: {}".format(
-                      _wall_h_in, len(_bands),
-                      ", ".join('"{:.0f}-{:.0f}"'.format(y0, y1) for y0, y1 in _bands)
-                  ) + Ansi.RESET)
-            panel_records = []
-            for _bi, (_y0, _y1) in enumerate(_bands):
-                _band_h_in = _y1 - _y0
-                _band_ops  = _clip_openings_to_band(_ext_openings, _y0, _y1)
-                _band_recs = process_wall(wall_id, _eff_wall_w, _band_h_in, _band_ops)
-                for _r in _band_recs:
-                    _r["y_in"] = round(_r["y_in"] + _y0, 4)
-                print("    Band {:d}: {:.0f}\"-{:.0f}\" ({:.2f} ft) → {:d} panels, "
-                      "{:d} opening(s)".format(
-                          _bi + 1, _y0, _y1, _band_h_in / 12.0,
-                          len(_band_recs), len(_band_ops)))
-                panel_records.extend(_band_recs)
-            for _idx, _r in enumerate(panel_records, start=1):
-                _r["panel_name"] = "P{:02d}".format(_idx)
+        panel_records = []
+        for _y0, _y1 in _bands:
+            _band_h_in = _y1 - _y0
+            _band_ops  = _clip_openings_to_band(_ext_openings, _y0, _y1)
+            _band_recs = process_wall(wall_id, _eff_wall_w, _band_h_in, _band_ops)
+            for _r in _band_recs: _r["y_in"] = round(_r["y_in"] + _y0, 4)
+            panel_records.extend(_band_recs)
+        for _idx, _r in enumerate(panel_records, start=1): _r["panel_name"] = "P{:02d}".format(_idx)
 
-        # Shift x_in back to wall_origin coordinates.
-        # Panels in the start-corner zone will have negative x_in, meaning
-        # placement_script places them BEFORE wall_origin along wall_dir —
-        # which is exactly the outer building corner.
-        if _p_start_ext > 0:
-            for _r in panel_records:
-                _r["x_in"] = round(_r["x_in"] - _p_start_ext, 4)
-        # -----------------------------------------------------------------------
+        # Shift x_in back to wall_origin coordinates
+        if _p_start_ext != 0.0:
+            for _r in panel_records: _r["x_in"] = round(_r["x_in"] - _p_start_ext, 4)
 
-        # Bake exterior normal so placement can rotate each panel to face out.
-        # _normal_xyz already parsed above in the depth section. Zeros if absent
-        # (placement then leaves family default facing).
-        if _normal_xyz is not None:
-            _nm = math.sqrt(sum(v*v for v in _normal_xyz))
-        else:
-            _nm = 0.0
-        if _normal_xyz is not None and _nm > 1e-9:
-            _wall_geom["wall_normal_x"] = round(_normal_xyz[0] / _nm, 8)
-            _wall_geom["wall_normal_y"] = round(_normal_xyz[1] / _nm, 8)
-            _wall_geom["wall_normal_z"] = round(_normal_xyz[2] / _nm, 8)
-        else:
-            _wall_geom["wall_normal_x"] = 0.0
-            _wall_geom["wall_normal_y"] = 0.0
-            _wall_geom["wall_normal_z"] = 0.0
+        # Bake exterior normal
+        _normal_xyz = _parse_xyz(wall_row.get("Normal(unit XYZ)", ""))
+        _nm = math.sqrt(sum(v*v for v in _normal_xyz)) if _normal_xyz else 0.0
+        _wall_geom["wall_normal_x"], _wall_geom["wall_normal_y"], _wall_geom["wall_normal_z"] = \
+            (round(_normal_xyz[0]/_nm, 8), round(_normal_xyz[1]/_nm, 8), round(_normal_xyz[2]/_nm, 8)) if _normal_xyz and _nm > 1e-9 else (0.0, 0.0, 0.0)
 
-        # Deterministic spin from wall_dir. Kept for round-trip/readability;
-        # placement default path uses normal, not this.
-        _rot_deg = round(
-            math.degrees(math.atan2(_wall_geom["wall_dir_y"],
-                                    _wall_geom["wall_dir_x"])) % 360.0, 4)
+        _rot_deg = round(math.degrees(math.atan2(_wall_geom["wall_dir_y"], _wall_geom["wall_dir_x"])) % 360.0, 4)
         for _pr in panel_records:
             _pr.update(_wall_geom)
             _pr["rotation_deg"] = _rot_deg
         all_panel_records.extend(panel_records)
 
     if not all_panel_records: return None, None
+    panels_path = write_csv(os.path.join(output_dir, output_filename), all_panel_records, [
+        "panel_name", "panel_type", "wall_id", "x_in", "y_in", "width_in", "height_in", "area_in2", 
+        "rotation_deg", "x_ref", "cutouts_json", "wall_origin_x", "wall_origin_y", "wall_origin_z", 
+        "wall_dir_x", "wall_dir_y", "wall_dir_z", "wall_normal_x", "wall_normal_y", "wall_normal_z"
+    ])
     
-    panels_csv = os.path.join(output_dir, output_filename)
-    fieldnames = [
-        "panel_name", "panel_type", "wall_id",
-        "x_in", "y_in", "width_in", "height_in",
-        "area_in2", "rotation_deg", "x_ref", "cutouts_json",
-        "wall_origin_x", "wall_origin_y", "wall_origin_z",
-        "wall_dir_x", "wall_dir_y", "wall_dir_z",
-        
-    ]
-    panels_path = write_csv(panels_csv, all_panel_records, fieldnames)
-    
-    config_path = None
     if panels_path and ACTIVE_CONFIG:
         config_path = os.path.join(output_dir, "config_used.json")
-        try:
-            if not os.path.exists(output_dir): os.makedirs(output_dir)
-            ACTIVE_CONFIG.save(config_path)
+        try: ACTIVE_CONFIG.save(config_path)
         except: pass
-    
     return panels_path, config_path
 
 def write_csv(path, rows, fieldnames=None):

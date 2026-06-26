@@ -19,7 +19,7 @@ from System.Windows.Forms import (
     Label, RadioButton, Button, FormBorderStyle, FormStartPosition,
     MessageBox, MessageBoxButtons, MessageBoxIcon, TextBox,
     Panel, ScrollableControl, AnchorStyles, DockStyle, Padding,
-    FlatStyle
+    FlatStyle, CheckBox
 )
 from System.Drawing import (
     Point, Size, Color, Font, FontStyle, ContentAlignment, GraphicsUnit,
@@ -173,18 +173,6 @@ INDENT  = 0     # rows dock to fill, no manual indent needed
 class ConfigDialog(Form):
     """Single Revit-style parameter grid - all config in one scrollable window."""
 
-    # Column geometry — computed at instance creation from DPI scale.
-    # Class-level values are fallback only; _init_scaled_geometry() overwrites them.
-    _LEFT   = 4
-    _LBL_W  = 210
-    _TXT_X  = 222
-    _TXT_W  = 115
-    _CLR1_X = 222
-    _CLR2_X = 352
-    _TOT_X  = 482
-    _TOT_W  = 75
-    _ROW_H  = 26
-
     def __init__(self, config):
         self._cfg = config
         self._init_scaled_geometry()
@@ -193,42 +181,34 @@ class ConfigDialog(Form):
     def _init_scaled_geometry(self):
         """Compute all pixel constants relative to the current DPI scale."""
         s = _DPI_SCALE
-        # Left inset
         self._LEFT   = _scale(4,   s)
-        # Label column width
         self._LBL_W  = _scale(210, s)
-        # Textbox x for single-value rows (left + lbl + 8px gap)
         self._TXT_X  = _scale(222, s)
-        # Textbox width (numeric)
         self._TXT_W  = _scale(115, s)
-        # Clearance column x positions
-        self._CLR1_X = _scale(222, s)   # Rough Opening textbox
-        self._CLR2_X = _scale(352, s)   # Panel Clearance textbox
-        self._TOT_X  = _scale(482, s)   # Total label
-        self._TOT_W  = _scale(75,  s)   # Total label width
-        # Row height
-        self._ROW_H  = _scale(26,  s)
-        # Diagram panel width
-        self._DIAG_W = _scale(280, s)
-
-    # _DIAG_W is set per-instance in _init_scaled_geometry()
+        self._CLR1_X = _scale(222, s)
+        self._CLR2_X = _scale(352, s)
+        self._TOT_X  = _scale(482, s)
+        self._TOT_W  = _scale(75,  s)
+        self._ROW_H  = _scale(34,  s)
 
     def _build(self):
         s = _DPI_SCALE
         self.Text            = "Panel Optimizer - Configuration"
         self.StartPosition   = FormStartPosition.CenterScreen
         self.FormBorderStyle = FormBorderStyle.Sizable
-        self.MinimumSize     = Size(_scale(900, s), _scale(580, s))
-        # Size the form to 80 % of screen real-estate, capped at a comfortable maximum
+        self.AutoScroll      = True
+        
+        # Resized window since we removed the diagram
+        self.MinimumSize = Size(_scale(850, s), _scale(600, s))
         sw, sh = _get_screen_size()
-        form_w = min(_scale(1020, s), int(sw * 0.82))
-        form_h = min(_scale(820,  s), int(sh * 0.82))
+        form_w = min(_scale(950, s), int(sw * 0.82))
+        form_h = min(_scale(820, s), int(sh * 0.82))
         self.ClientSize      = Size(form_w, form_h)
         self.TopMost         = True
         self.BackColor       = CLR_BODY_BG
         self.Font            = FNT_NORMAL
 
-        # --- Title strip (top, fixed height) ---
+        # --- Title strip ---
         title_h = _scale(38, s)
         tp = Panel()
         tp.Dock      = DockStyle.Top
@@ -243,7 +223,7 @@ class ConfigDialog(Form):
         tp.Controls.Add(tl)
         self.Controls.Add(tp)
 
-        # --- Button bar (bottom, fixed height, always visible) ---
+        # --- Button bar ---
         btn_bar_h  = _scale(48, s)
         btn_w_ok   = _scale(120, s)
         btn_w_can  = _scale(90,  s)
@@ -276,26 +256,10 @@ class ConfigDialog(Form):
         bb.Controls.Add(self._btnCancel)
         self.Controls.Add(bb)
 
-        # Position buttons - must happen after bb is added
         bb.SizeChanged += self._reposition_buttons
         self._bb = bb
 
-        # --- Diagram panel (right side, fixed width) ---
-        self._diag = Panel()
-        self._diag.Dock      = DockStyle.Right
-        self._diag.Width     = self._DIAG_W
-        self._diag.BackColor = Color.FromArgb(250, 251, 254)
-        self._diag.Paint    += self._draw_diagram
-        self.Controls.Add(self._diag)
-
-        # Thin separator line between scroll and diagram
-        sep = Panel()
-        sep.Dock      = DockStyle.Right
-        sep.Width     = 1
-        sep.BackColor = Color.FromArgb(190, 200, 215)
-        self.Controls.Add(sep)
-
-        # --- Scrollable body (fills remaining space) ---
+        # --- Scrollable body ---
         self._scroll = ScrollableControl()
         self._scroll.Dock       = DockStyle.Fill
         self._scroll.AutoScroll = True
@@ -303,205 +267,6 @@ class ConfigDialog(Form):
         self.Controls.Add(self._scroll)
 
         self._populate_rows()
-
-    def _draw_diagram(self, sender, e):
-        """
-        Draws a single panel with a cutout opening, showing:
-        - Rough opening clearance  (gap between opening edge and rough frame)
-        - Panel clearance          (gap from rough frame to panel edge)
-        Styled like the reference sketch: clean line-art on white.
-        """
-        from System.Drawing import Drawing2D
-        g = e.Graphics
-        g.SmoothingMode = Drawing2D.SmoothingMode.AntiAlias
-        # TextRenderingHint not available in IronPython Drawing2D
-
-        W = sender.ClientSize.Width
-        H = sender.ClientSize.Height
-
-        # ---- colours / pens ----
-        c_bg      = Color.White
-        c_panel   = Color.FromArgb(248, 248, 248)
-        c_border  = Color.FromArgb(80,  80,  80)
-        c_dim     = Color.FromArgb(60,  60,  60)
-        c_opening = Color.White
-        c_ro_fill = Color.FromArgb(230, 240, 255)   # rough opening zone tint
-        c_cp_fill = Color.FromArgb(255, 240, 220)   # clearance-to-panel zone tint
-
-        pen_panel  = Pen(c_border, 1.5)
-        pen_dim    = Pen(c_dim,    1.0)
-        pen_thin   = Pen(Color.FromArgb(160, 160, 160), 0.75)
-
-        fnt_lbl  = Font("Segoe UI", 7.5, FontStyle.Regular, GraphicsUnit.Point)
-        fnt_bold = Font("Segoe UI", 7.5, FontStyle.Bold,    GraphicsUnit.Point)
-        fnt_ttl  = Font("Segoe UI", 8.5, FontStyle.Bold,    GraphicsUnit.Point)
-
-        sf_c = StringFormat()
-        sf_c.Alignment     = StringAlignment.Center
-        sf_c.LineAlignment = StringAlignment.Center
-
-        sf_l = StringFormat()
-        sf_l.Alignment     = StringAlignment.Near
-        sf_l.LineAlignment = StringAlignment.Center
-
-        brush_dim   = SolidBrush(c_dim)
-        brush_open  = SolidBrush(Color.FromArgb(120, 130, 145))
-        brush_white = SolidBrush(Color.White)
-
-        # ---- layout ----
-        # Panel occupies most of the diagram
-        pad    = 30          # outer margin
-        ttl_h  = 28          # space for title at top
-        pnl_x  = pad
-        pnl_y  = pad + ttl_h
-        pnl_w  = W - pad * 2
-        pnl_h  = H - pnl_y - pad - 20
-
-        # Clearance zone thicknesses (pixels)
-        ro_px  = 10   # rough opening clearance thickness
-        cp_px  = 18   # clearance to panel thickness
-
-        # Opening void sits centred in the panel
-        op_margin_x = cp_px + ro_px + 30   # left/right space
-        op_margin_y = cp_px + ro_px + 20   # top/bottom space
-        op_x = pnl_x + op_margin_x
-        op_y = pnl_y + op_margin_y
-        op_w = pnl_w - op_margin_x * 2
-        op_h = pnl_h - op_margin_y * 2
-
-        # Rough opening frame (sits between opening and clearance-to-panel zone)
-        rf_x = op_x - ro_px
-        rf_y = op_y - ro_px
-        rf_w = op_w + ro_px * 2
-        rf_h = op_h + ro_px * 2
-
-        # ---- draw background ----
-        with SolidBrush(c_bg) as b:
-            g.FillRectangle(b, 0, 0, W, H)
-
-        # ---- title ----
-        with SolidBrush(Color.FromArgb(50, 50, 50)) as b:
-            rf = RectangleF(float(pnl_x), 6.0, float(pnl_w), float(ttl_h))
-            g.DrawString("Clearance Reference", fnt_ttl, b, rf, sf_c)
-
-        # ---- panel fill ----
-        with SolidBrush(c_panel) as b:
-            g.FillRectangle(b, pnl_x, pnl_y, pnl_w, pnl_h)
-
-        # ---- clearance-to-panel zones (coloured) ----
-        # Left strip
-        with SolidBrush(c_cp_fill) as b:
-            g.FillRectangle(b, pnl_x,            rf_y, cp_px, rf_h)
-        # Right strip
-        with SolidBrush(c_cp_fill) as b:
-            g.FillRectangle(b, rf_x + rf_w,       rf_y, cp_px, rf_h)
-        # Top strip
-        with SolidBrush(c_cp_fill) as b:
-            g.FillRectangle(b, rf_x - cp_px,      pnl_y, rf_w + cp_px*2, cp_px)
-        # Bottom strip
-        with SolidBrush(c_cp_fill) as b:
-            g.FillRectangle(b, rf_x - cp_px,      rf_y + rf_h, rf_w + cp_px*2, cp_px)
-
-        # ---- rough opening zones (different colour) ----
-        with SolidBrush(c_ro_fill) as b:
-            g.FillRectangle(b, rf_x, rf_y, ro_px, rf_h)          # left
-            g.FillRectangle(b, op_x + op_w, rf_y, ro_px, rf_h)   # right
-            g.FillRectangle(b, rf_x, rf_y, rf_w, ro_px)          # top
-            g.FillRectangle(b, rf_x, op_y + op_h, rf_w, ro_px)   # bottom
-
-        # ---- opening void ----
-        with SolidBrush(c_opening) as b:
-            g.FillRectangle(b, op_x, op_y, op_w, op_h)
-
-        # ---- panel border ----
-        g.DrawRectangle(pen_panel, pnl_x, pnl_y, pnl_w, pnl_h)
-
-        # ---- rough opening frame border ----
-        g.DrawRectangle(pen_thin, rf_x, rf_y, rf_w, rf_h)
-
-        # ---- opening border ----
-        g.DrawRectangle(pen_thin, op_x, op_y, op_w, op_h)
-
-        # ---- opening label ----
-        with SolidBrush(brush_open.Color) as b:
-            rf2 = RectangleF(float(op_x), float(op_y), float(op_w), float(op_h))
-            g.DrawString("Opening", fnt_bold, b, rf2, sf_c)
-
-        # ---- dimension arrows ----
-        # Helper: draw bracket/arrow line with label
-        def h_arrow(x1, x2, ay, label, above=True):
-            """Horizontal dimension line with tick marks and label."""
-            if abs(x2 - x1) < 3:
-                return
-            # line
-            g.DrawLine(pen_dim, x1, ay, x2, ay)
-            # ticks
-            g.DrawLine(pen_dim, x1, ay - 4, x1, ay + 4)
-            g.DrawLine(pen_dim, x2, ay - 4, x2, ay + 4)
-            # label
-            lh = 13.0
-            ly = float(ay - lh - 1) if above else float(ay + 2)
-            g.DrawString(label, fnt_lbl, brush_dim,
-                         RectangleF(float(x1), ly, float(x2 - x1), lh), sf_c)
-
-        def v_arrow(vx, y1, y2, label, right=True):
-            """Vertical dimension line with tick marks and label to the side."""
-            if abs(y2 - y1) < 3:
-                return
-            g.DrawLine(pen_dim, vx, y1, vx, y2)
-            g.DrawLine(pen_dim, vx - 4, y1, vx + 4, y1)
-            g.DrawLine(pen_dim, vx - 4, y2, vx + 4, y2)
-            mid = (y1 + y2) / 2.0
-            lw  = 95.0
-            lx  = float(vx + 6) if right else float(vx - lw - 6)
-            g.DrawString(label, fnt_lbl, brush_dim,
-                         RectangleF(lx, mid - 7.0, lw, 14.0), sf_l)
-
-        # -- Jamb: rough opening (left side) --
-        ax_ro = pnl_x + cp_px + ro_px // 2   # midpoint of RO zone
-        v_arrow(ax_ro, rf_y, op_y + op_h, "Rough Opening", right=False)
-
-        # -- Jamb: clearance to panel (left side) --
-        ax_cp = pnl_x + cp_px // 2
-        v_arrow(ax_cp, rf_y, op_y + op_h, "Clearance to Panel", right=False)
-
-        # -- Header: top (horizontal) --
-        hy = pnl_y + cp_px // 2
-        h_arrow(rf_x, op_x + op_w // 2, hy, "Header CLR", above=False)
-
-        # -- Sill: bottom (horizontal) --
-        sy = pnl_y + pnl_h - cp_px // 2
-        h_arrow(rf_x, op_x + op_w // 2, sy, "Sill CLR", above=True)
-
-        # ---- legend ----
-        leg_y = pnl_y + pnl_h + 6
-        lx = pnl_x
-        items = [
-            (c_cp_fill, "Clearance to Panel"),
-            (c_ro_fill, "Rough Opening CLR"),
-        ]
-        for idx, (col, txt) in enumerate(items):
-            bx = lx + idx * 130
-            with SolidBrush(col) as b:
-                g.FillRectangle(b, bx, leg_y, 10, 10)
-            with Pen(Color.FromArgb(140, 140, 140), 0.75) as p:
-                g.DrawRectangle(p, bx, leg_y, 10, 10)
-            with SolidBrush(c_dim) as b:
-                g.DrawString(txt, fnt_lbl, b,
-                             RectangleF(float(bx + 13), float(leg_y - 1), 115.0, 12.0), sf_l)
-
-        # cleanup
-        pen_panel.Dispose()
-        pen_dim.Dispose()
-        pen_thin.Dispose()
-        fnt_lbl.Dispose()
-        fnt_bold.Dispose()
-        fnt_ttl.Dispose()
-        sf_c.Dispose()
-        sf_l.Dispose()
-        brush_dim.Dispose()
-        brush_open.Dispose()
-        brush_white.Dispose()
 
     def _reposition_buttons(self, s, e):
         w = self._bb.ClientSize.Width
@@ -511,7 +276,9 @@ class ConfigDialog(Form):
         self._btnOK.Location     = Point(w - ok_w - can_w - gap * 2, _scale(9, _DPI_SCALE))
         self._btnCancel.Location = Point(w - can_w - gap,             _scale(9, _DPI_SCALE))
 
+
     def _populate_rows(self):
+        s = _DPI_SCALE
         y = 4
 
         # Identity
@@ -546,7 +313,7 @@ class ConfigDialog(Form):
         ]:
             y = self._num_row(y, lbl, val, attr)
 
-        # Door Clearances
+        # Clearances...
         y = self._section(y, "Door Clearances")
         y = self._clr_header(y)
         dc = self._cfg.door_clearances
@@ -557,7 +324,6 @@ class ConfigDialog(Form):
         ]:
             y = self._clr_row(y, side, rv, pv, ra, pa)
 
-        # Window Clearances
         y = self._section(y, "Window Clearances")
         y = self._clr_header(y)
         wc = self._cfg.window_clearances
@@ -568,7 +334,6 @@ class ConfigDialog(Form):
         ]:
             y = self._clr_row(y, side, rv, pv, ra, pa)
 
-        # Storefront Clearances
         y = self._section(y, "Storefront Clearances")
         y = self._clr_header(y)
         sc = self._cfg.storefront_clearances
@@ -579,8 +344,7 @@ class ConfigDialog(Form):
         ]:
             y = self._clr_row(y, side, rv, pv, ra, pa)
 
-        # Wall Opening Clearances
-        y = self._section(y, "Wall Opening Clearances (pure void - zero by default)")
+        y = self._section(y, "Wall Opening Clearances")
         y = self._clr_header(y)
         woc = self._cfg.wall_opening_clearances
         for side, rv, pv, ra, pa in [
@@ -590,22 +354,34 @@ class ConfigDialog(Form):
         ]:
             y = self._clr_row(y, side, rv, pv, ra, pa)
 
-        # Optimization Strategy
+        # Optimization Strategy (4 Approaches)
         y = self._section(y, "Optimization Strategy")
         os_ = self._cfg.optimization_strategy
 
-        # ── Main strategy ────────────────────────────────────────────────
-        cur_goal = "Minimize Unique Panels" if os_.minimize_unique_panels else "Largest Panel Possible"
+        # Determine current selection
+        if getattr(os_, 'best_to_manufacture', False):
+            cur_goal = "Best to Manufacture"
+        elif getattr(os_, 'use_ga_optimizer', False):
+            cur_goal = "Genetic Algorithm"
+        elif getattr(os_, 'minimize_unique_panels', False):
+            cur_goal = "Minimize Unique"
+        else:
+            cur_goal = "Minimize Total Panels"
+
         y = self._radio_row(y, "Optimization Goal",
-                            ["Largest Panel Possible", "Minimize Unique Panels"],
+                            ["Minimize Total Panels", "Minimize Unique", "Genetic Algorithm", "Best to Manufacture"],
                             cur_goal, "_rb_goal")
 
-        DESC_H = self._ROW_H * 2 + _scale(4, _DPI_SCALE)
+        _cur_weight = getattr(os_, "unique_weight", 10.0)
+        y = self._num_row(y, "DfMA Penalty: 1 Unique Type equals how many Total Panels?",
+                          _cur_weight, "_txt_weight")
+
+        DESC_H = self._ROW_H * 2 - _scale(6, _DPI_SCALE)
         for _desc, _bg in [
-            ("Largest Panel Possible: Places the biggest panel that meets all constraints "
-             "across the facade. Each opening may produce a unique panel type.", CLR_ROW_ALT),
-            ("Minimize Unique Panels: Designs identical panels around repeating window "
-             "patterns so as many panels as possible share the same fabrication type.", CLR_ROW_ALT),
+            ("Minimize Total Panels: Places the biggest panel that meets all constraints across the facade, resulting in the fewest physical panels to install. Each opening may produce a unique panel type.", CLR_ROW_ALT),
+            ("Minimize Unique: Designs identical panels around repeating window patterns so as many panels as possible share the same fabrication type.", CLR_ROW_ALT),
+            ("Genetic Algorithm: Uses evolutionary math to find the perfect 1:1 balance between total installation labor and unique fabrication complexity.", CLR_ROW_ALT),
+            ("Best to Manufacture: Runs a tournament between all three strategies and automatically selects the layout with the lowest total DfMA score.", CLR_ROW_ALT)
         ]:
             _dr = self._make_row(y, _bg, DESC_H)
             _dl = Label()
@@ -614,8 +390,8 @@ class ConfigDialog(Form):
             _dl.ForeColor = Color.FromArgb(80, 80, 80)
             _dl.AutoSize  = False
             row_w = self._scroll.ClientSize.Width
-            if row_w < 100:
-                row_w = self.ClientSize.Width - self._DIAG_W - 20
+            if row_w < 100: row_w = self.ClientSize.Width - 20
+            
             _dl.Size     = Size(max(row_w - _scale(30, _DPI_SCALE), _scale(400, _DPI_SCALE)),
                                 DESC_H - _scale(4, _DPI_SCALE))
             _dl.Location = Point(self._LEFT + _scale(16, _DPI_SCALE), _scale(4, _DPI_SCALE))
@@ -623,8 +399,8 @@ class ConfigDialog(Form):
             self._scroll.Controls.Add(_dr)
             y += DESC_H + 1
 
-        # ── Panels WITH openings (visible only under Minimize Unique) ────
-        y = self._section(y, "  Panels with Openings  (applies when Minimize Unique Panels is selected)")
+        # ── Panels WITH openings ─────────────────────────────────────────
+        y = self._section(y, "  Panels with Openings  (applies when Minimize Unique is selected)")
         _cur_align = getattr(os_, "opening_alignment", "opening_derived")
         _align_rev = {
             "opening_derived": "Opening-Derived Width",
@@ -653,8 +429,8 @@ class ConfigDialog(Form):
             _dl.ForeColor = Color.FromArgb(80, 80, 80)
             _dl.AutoSize  = False
             row_w2 = self._scroll.ClientSize.Width
-            if row_w2 < 100:
-                row_w2 = self.ClientSize.Width - self._DIAG_W - 20
+            if row_w2 < 100: row_w2 = self.ClientSize.Width - 20
+                
             _dl.Size     = Size(max(row_w2 - _scale(30, _DPI_SCALE), _scale(400, _DPI_SCALE)),
                                 ALIGN_DESC_H - _scale(4, _DPI_SCALE))
             _dl.Location = Point(self._LEFT + _scale(16, _DPI_SCALE), _scale(4, _DPI_SCALE))
@@ -667,17 +443,17 @@ class ConfigDialog(Form):
                           _void1_left_val, "_void1_x_offset_left")
 
         # ── Panels WITHOUT openings ──────────────────────────────────────
-        y = self._section(y, "  No-Opening Panels  (applies when Minimize Unique Panels is selected)")
+        y = self._section(y, "  No-Opening Panels  (applies when Minimize Unique is selected)")
         _cur_nw = getattr(os_, "nonwindow_strategy", "largest")
-        _nw_rev = {"largest": "Largest Possible", "standardise": "Identical (match standard W)"}
-        _cur_nw_lbl = _nw_rev.get(_cur_nw, "Largest Possible")
+        _nw_rev = {"largest": "Minimize Total Panels", "standardise": "Identical (match standard W)"}
+        _cur_nw_lbl = _nw_rev.get(_cur_nw, "Minimize Total Panels")
         y = self._radio_row(y, "No-Opening Panel Strategy",
-                            ["Largest Possible", "Identical (match standard W)"],
+                            ["Minimize Total Panels", "Identical (match standard W)"],
                             _cur_nw_lbl, "_rb_nw")
 
         NW_DESC_H = self._ROW_H * 2 + _scale(4, _DPI_SCALE)
         for _nwdesc in [
-            ("Largest Possible: Edge and no-opening zones use the largest panel that fits. "
+            ("Minimize Total Panels: Edge and no-opening zones use the largest panel that fits. "
              "These panels may be different widths from each other and from the window panels."),
             ("Identical (match standard W): Use the same width W as the window panels in "
              "edge/no-opening zones too, so the whole facade shares as few unique types as possible."),
@@ -689,8 +465,8 @@ class ConfigDialog(Form):
             _nwdl.ForeColor = Color.FromArgb(80, 80, 80)
             _nwdl.AutoSize  = False
             row_w3 = self._scroll.ClientSize.Width
-            if row_w3 < 100:
-                row_w3 = self.ClientSize.Width - self._DIAG_W - 20
+            if row_w3 < 100: row_w3 = self.ClientSize.Width - 20
+                
             _nwdl.Size     = Size(max(row_w3 - _scale(30, _DPI_SCALE), _scale(400, _DPI_SCALE)),
                                   NW_DESC_H - _scale(4, _DPI_SCALE))
             _nwdl.Location = Point(self._LEFT + _scale(16, _DPI_SCALE), _scale(4, _DPI_SCALE))
@@ -700,13 +476,15 @@ class ConfigDialog(Form):
 
         self._scroll.AutoScrollMinSize = Size(_scale(600, _DPI_SCALE), y + _scale(60, _DPI_SCALE))
 
+
+
     # ---------------------------------------------------------------- row builders
 
     def _make_row(self, y, bg, h=None):
         row = Panel()
         row.Location  = Point(0, y)
         w = self._scroll.ClientSize.Width
-        if w < 100: w = self.ClientSize.Width - self._DIAG_W - 20
+        if w < 100: w = self.ClientSize.Width - 20
         h = h if h is not None else self._ROW_H
         row.Size = Size(max(w, _scale(580, _DPI_SCALE)), h)
         row.Anchor    = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
@@ -856,7 +634,8 @@ class ConfigDialog(Form):
 
         radios = []
         rx = self._TXT_X
-        radio_step = _scale(185, _DPI_SCALE)
+        # Scaled spacing to fit all 4 options nicely across the wider window
+        radio_step = _scale(165, _DPI_SCALE) 
         for opt_text in options:
             rb = RadioButton()
             rb.Text     = opt_text
@@ -972,11 +751,17 @@ class ConfigDialog(Form):
         woc.rough_sill   = self._flt("_woc_rs", woc.rough_sill)
         woc.panel_sill   = self._flt("_woc_ps", woc.panel_sill)
 
-        # Optimization Strategy
+
+        # --- Optimization Strategy Selection ---
         os_ = self._cfg.optimization_strategy
-        os_.minimize_unique_panels = ("Minimize" in self._selected("_rb_goal"))
-        tol = self._flt("_strat_tol", os_.cutout_tolerance)
-        os_.cutout_tolerance = max(0.0, tol)
+        selected_goal = self._selected("_rb_goal")
+        
+        # Exact string match prevents "Minimize" from triggering both flags
+        os_.best_to_manufacture    = (selected_goal == "Best to Manufacture")
+        os_.use_ga_optimizer       = (selected_goal == "Genetic Algorithm")
+        os_.minimize_unique_panels = (selected_goal == "Minimize Unique")
+
+        os_.unique_weight = self._flt("_txt_weight", 10.0)
 
         # Opening alignment strategy
         _align_map = {
@@ -990,7 +775,7 @@ class ConfigDialog(Form):
 
         # No-opening panel strategy
         _nw_map = {
-            "Largest Possible":           "largest",
+            "Minimize Total Panels":        "largest",
             "Identical (match standard W)": "standardise",
         }
         os_.nonwindow_strategy = _nw_map.get(self._selected("_rb_nw"), "largest")
@@ -998,12 +783,11 @@ class ConfigDialog(Form):
         self.DialogResult = DialogResult.OK
         self.Close()
 
-
 def show_config_dialog(config):
-    owner = get_revit_owner()
-    dlg = ConfigDialog(config)
-    result = dlg.ShowDialog(owner) if owner else dlg.ShowDialog()
-    return result == DialogResult.OK
+    form = ConfigDialog(config) 
+    if form.ShowDialog() == DialogResult.OK:
+        return True
+    return False
 
 
 # =================

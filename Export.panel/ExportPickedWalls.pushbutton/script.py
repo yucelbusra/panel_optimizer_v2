@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-FACADE-BY-FACADE EXPORT
-Combines adjacent BASIC WALLS into a single facade sequence.
-Openings (doors, windows) remain separate.
+WALL-BY-WALL EXPORT
+Exports Basic Walls and unpacked Stacked Walls individually.
+Openings (doors, windows, storefronts) are mapped to their specific host wall.
 """
 from Autodesk.Revit.DB import (
     FilteredElementCollector, Wall, BuiltInParameter, LocationPoint, XYZ,
@@ -109,68 +109,59 @@ def level_name(elem):
             or get_param_val(elem, "Level", as_string=True)
             or "")
 
-def get_sequential_wall_geometry(walls):
+def get_single_wall_geometry(wall):
     """
-    Compute the true visual-left → visual-right extent of a combined facade
-    from the location curve endpoints of all selected wall segments.
-
-    IMPORTANT — Location Line dependency:
-      GetEndPoint() returns the LOCATION CURVE endpoint, which at a corner
-      join is trimmed to the intersection of the two walls' reference lines.
-      The reference line used depends on the wall's Location Line parameter:
-
-        "Wall Center"     → endpoint is at the ADJACENT wall's center line
-                            → inset from the outer corner by half the
-                              adjacent wall's thickness
-                            → leaves a visible gap at building corners
-
-        "Finish Exterior" → endpoint is at the ADJACENT wall's exterior face
-                            → sits at the outer corner of the building
-                            → panels start flush with the facade face ✓
-
-      RECOMMENDATION: set facade walls to "Finish Exterior" before exporting
-      so that Start(X,Y,Z) captures the true outer face of the building.
+    Compute the true visual-left -> visual-right extent of a single wall.
+    Accurately extracts Z-elevation using BoundingBox for Stacked Wall members.
     """
-    if not walls: return None
+    if not wall: return None
 
-    all_pts = []
-    for w in walls:
-        lc = w.Location.Curve
-        all_pts.append(lc.GetEndPoint(0))
-        all_pts.append(lc.GetEndPoint(1))
-
+    lc = wall.Location.Curve
+    p0 = lc.GetEndPoint(0)
+    p1 = lc.GetEndPoint(1)
+    
     try:
-        normal = walls[0].Orientation
+        normal = wall.Orientation
         up     = XYZ(0, 0, 1)
         visual_right_dir = normal.CrossProduct(up).Normalize()
     except Exception:
         visual_right_dir = XYZ(1, 0, 0)
 
+    # Calculate absolute X/Y span
+    all_pts = [p0, p1]
     start_pt = min(all_pts, key=lambda p: p.DotProduct(visual_right_dir))
     end_pt   = max(all_pts, key=lambda p: p.DotProduct(visual_right_dir))
 
-    min_z = min(p.Z for p in all_pts)
-    max_z = min_z
-    for w in walls:
-        try:
-            h   = w.get_Parameter(BuiltInParameter.WALL_USER_HEIGHT_PARAM).AsDouble()
-            top = w.Location.Curve.GetEndPoint(0).Z + h
-            if top > max_z: max_z = top
-        except Exception: pass
+    vec = (end_pt - start_pt).Normalize()
 
-    total_len = sum(w.Location.Curve.Length for w in walls)
-    vec       = (end_pt - start_pt).Normalize()
-    true_end  = start_pt + (vec * total_len)
+    # --- FIX: True Absolute Z-Elevation for Stacked Wall Members ---
+    # Do not trust Location.Curve Z for sub-walls. Pull the true physical BoundingBox.
+    try:
+        bb = wall.get_BoundingBox(None)
+        if bb:
+            min_z = bb.Min.Z
+            max_z = bb.Max.Z
+        else:
+            # Fallback if BB fails
+            min_z = min(p.Z for p in all_pts)
+            h = wall.get_Parameter(BuiltInParameter.WALL_USER_HEIGHT_PARAM).AsDouble()
+            max_z = min_z + (h if h else 10.0)
+    except Exception:
+        min_z = min(p.Z for p in all_pts)
+        max_z = min_z
+
+    # Re-map the start and end points to the true absolute Z plane
+    start_pt = XYZ(start_pt.X, start_pt.Y, min_z)
+    end_pt   = XYZ(end_pt.X, end_pt.Y, min_z)
 
     return {
         'start':     start_pt,
-        'end':       true_end,
+        'end':       end_pt,
         'direction': vec,
         'height':    max_z - min_z,
-        'min_z':     min_z
+        'min_z':     min_z,
+        'length':    lc.Length
     }
-
-
 
 def _normalize_xy(v):
     mag = (v.X * v.X + v.Y * v.Y) ** 0.5
@@ -178,163 +169,26 @@ def _normalize_xy(v):
         return None
     return XYZ(v.X / mag, v.Y / mag, 0.0)
 
-def _vec_str(v, nd=6):
-    if not v:
-        return ""
-    return "({0},{1},{2})".format(rnum(v.X, nd), rnum(v.Y, nd), rnum(v.Z, nd))
-
-def get_facade_basis(walls, building_centroid_xy=None):
-    """
-    Returns:
-        outward_normal : unit XY vector pointing to the true exterior
-        left_to_right  : unit XY vector representing visual LEFT->RIGHT
-                         when standing OUTSIDE and looking at the facade
-        origin         : facade start point at the visual-left end
-        end            : facade end point at the visual-right end
-        length_ft      : facade run length
-    """
-    geo = get_sequential_wall_geometry(walls)
-    origin = geo['start']
-    end    = geo['end']
-    length_ft = geo['length']
-
-    rep = walls[0]
-    outward = _normalize_xy(rep.Orientation)
-    if outward is None:
-        raise Exception("Could not compute facade outward normal from wall.Orientation.")
-
-    # Midpoint of facade
-    midx = (origin.X + end.X) / 2.0
-    midy = (origin.Y + end.Y) / 2.0
-
-    # Flip if normal points toward centroid (interior)
-    if building_centroid_xy is not None:
-        vx = building_centroid_xy[0] - midx
-        vy = building_centroid_xy[1] - midy
-        dot = vx * outward.X + vy * outward.Y
-        if dot > 0:
-            outward = XYZ(-outward.X, -outward.Y, 0.0)
-
-    # Visual LEFT -> RIGHT when standing OUTSIDE and facing the wall
-    left_to_right = outward.CrossProduct(XYZ.BasisZ)
-    left_to_right = _normalize_xy(left_to_right)
-    if left_to_right is None:
-        raise Exception("Could not compute facade left-to-right axis.")
-
-    return {
-        "outward_normal": outward,
-        "left_to_right": left_to_right,
-        "origin": origin,
-        "end": end,
-        "length_ft": length_ft
-    }
-
-# ========== FACADE GROUPING HELPERS ==========
-
-def group_walls_by_facade(walls, dir_tol=0.05, perp_tol=1.0):
-    """
-    Partition basic walls into collinear facade groups.
-    Two walls belong to the same facade if:
-      1. Their XY direction vectors are parallel  (|cross| < dir_tol ≈ sin 3°)
-      2. A point on one wall is within perp_tol ft of the other wall's line
-    Returns a list of lists, each sub-list is one facade group.
-    """
-    groups   = []
-    assigned = set()
-    for i, wall in enumerate(walls):
-        if i in assigned:
-            continue
-        try:
-            lc = wall.Location.Curve
-            p0 = lc.GetEndPoint(0)
-            p1 = lc.GetEndPoint(1)
-            dx, dy = p1.X - p0.X, p1.Y - p0.Y
-            mag = (dx*dx + dy*dy) ** 0.5
-            if mag < 0.001:
-                groups.append([wall]); assigned.add(i); continue
-            n = (dx/mag, dy/mag)
-        except Exception:
-            groups.append([wall]); assigned.add(i); continue
-
-        group = [wall]
-        assigned.add(i)
-
-        for j, other in enumerate(walls):
-            if j in assigned:
-                continue
-            try:
-                olc = other.Location.Curve
-                op0 = olc.GetEndPoint(0)
-                op1 = olc.GetEndPoint(1)
-                odx, ody = op1.X - op0.X, op1.Y - op0.Y
-                omag = (odx*odx + ody*ody) ** 0.5
-                if omag < 0.001:
-                    continue
-                on = (odx/omag, ody/omag)
-                if abs(n[0]*on[1] - n[1]*on[0]) > dir_tol:   # not parallel
-                    continue
-                vx = op0.X - p0.X
-                vy = op0.Y - p0.Y
-                if abs(vx*n[1] - vy*n[0]) > perp_tol:        # not collinear
-                    continue
-                group.append(other)
-                assigned.add(j)
-            except Exception:
-                continue
-
-        groups.append(group)
-    return groups
-
-
-def get_facade_label(wall, used_labels):
-    """
-    Return a unique compass-direction label for a facade based on wall.Orientation.
-    Cardinal examples:  N  S  E  W  NE  NW  SE  SW
-    If two facades share a direction, append a counter: N, N2, N3, ...
-    """
-    import math as _m
-    try:
-        nx = wall.Orientation.X
-        ny = wall.Orientation.Y
-        angle  = _m.degrees(_m.atan2(ny, nx)) % 360.0
-        names  = ['E','NE','N','NW','W','SW','S','SE']
-        base   = names[int((angle + 22.5) / 45) % 8]
-    except Exception:
-        base = 'F'
-    label = base
-    n = 2
-    while label in used_labels:
-        label = '{}{}'.format(base, n)
-        n += 1
-    used_labels.add(label)
-    return label
-
-
 def find_group_for_opening(opening, group_data, wall_to_group):
     """
     Return the group-dict that an opening (door/window/curtain wall) belongs to.
-    Tries host-wall lookup first; falls back to nearest facade by perpendicular distance.
     """
-    # 1. Via .Host property (doors/windows)
     try:
         host = opening.Host
         if host:
             g = wall_to_group.get(host.Id.IntegerValue)
             if g is not None: return g
     except Exception: pass
-    # 2. Via HOST_ID_PARAM (alternative for some family instances)
     try:
         hip = opening.get_Parameter(BuiltInParameter.HOST_ID_PARAM)
         if hip:
             g = wall_to_group.get(hip.AsElementId().IntegerValue)
             if g is not None: return g
     except Exception: pass
-    # 3. Curtain wall — look up its own element id
     try:
         g = wall_to_group.get(opening.Id.IntegerValue)
         if g is not None: return g
     except Exception: pass
-    # 4. Geometric fallback: nearest facade by perpendicular distance
     try:
         if isinstance(opening, Wall):
             lc = opening.Location.Curve
@@ -378,47 +232,44 @@ print("Processing {} selected walls...".format(len(selected_walls)))
 basic_walls = []
 for wall in selected_walls:
     try:
-        kind_name = str(wall.WallType.Kind)
-        if kind_name.lower() == "basic":
+        kind_name = str(wall.WallType.Kind).lower()
+        if kind_name == "basic":
             basic_walls.append(wall)
+        elif kind_name == "stacked":
+            # Extract Basic Walls from inside the Stacked Wall
+            member_ids = wall.GetStackedWallMemberIds()
+            for mid in member_ids:
+                member_wall = doc.GetElement(mid)
+                if member_wall and isinstance(member_wall, Wall):
+                    basic_walls.append(member_wall)
+                    selected_wall_ids.add(mid.IntegerValue)
+            print("  [INFO] Unpacked {} basic walls from Stacked Wall {}".format(len(member_ids), wall.Id.IntegerValue))
     except:
         basic_walls.append(wall)
 
-print("  {} basic walls across all selected facades".format(len(basic_walls)))
+print("  {} basic walls to analyze".format(len(basic_walls)))
 
-# ========== GROUP WALLS INTO FACADES ==========
-facade_groups = group_walls_by_facade(basic_walls)
-print("  {} facade group(s) detected".format(len(facade_groups)))
+# ========== PREPARE WALLS FOR INDIVIDUAL EXPORT ==========
+print("\nPreparing walls for individual export...")
 
-_tol          = 0.01   # ft (~1/8 in)
-_used_labels  = set()
-_group_data   = []     # one dict per facade
-for _grp in facade_groups:
-    _geo   = get_sequential_wall_geometry(_grp)
-    _cid   = _grp[0].Id.IntegerValue   # fallback
-    _found = False
-    for _cw in _grp:
-        _lc = _cw.Location.Curve
-        for _pt in [_lc.GetEndPoint(0), _lc.GetEndPoint(1)]:
-            if _pt.DistanceTo(_geo['start']) < _tol:
-                _cid = _cw.Id.IntegerValue
-                _found = True
-                break
-        if _found: break
-    _label = get_facade_label(_grp[0], _used_labels)
-    _group_data.append({'walls': _grp, 'geo': _geo, 'id': _cid, 'label': _label})
-    print("  Facade '{}': {} wall(s) | combined_id={}{}".format(
-          _label, len(_grp), _cid,
-          '' if _found else ' [WARN: no endpoint at geo start]'))
-
-# Build wall-id → group lookup (basic walls only at this stage)
+_group_data   = []
 _wall_to_group = {}
-for _gd in _group_data:
-    for _w in _gd['walls']:
-        _wall_to_group[_w.Id.IntegerValue] = _gd
+
+for wall in basic_walls:
+    _geo = get_single_wall_geometry(wall)
+    if not _geo: continue
+    
+    _cid = wall.Id.IntegerValue
+    _label = "Wall_{}".format(_cid)
+    
+    _gd = {'walls': [wall], 'geo': _geo, 'id': _cid, 'label': _label}
+    _group_data.append(_gd)
+    _wall_to_group[_cid] = _gd
+
+print("  {} individual wall(s) queued for export.".format(len(_group_data)))
 
 # ========== EXPORT WALLS CSV ==========
-print("\nExporting combined basic walls to CSV...")
+print("\nExporting walls to CSV...")
 
 try:
     with codecs.open(WALLS_PATH, mode="w", encoding="utf-8") as f:
@@ -431,7 +282,6 @@ try:
             "ArcRadius(ft)","ArcAngle(rad)","ArcCenter(X,Y,Z)","AxisDir(unit XYZ)","Normal(unit XYZ)",
             "StructFaceOffset(ft)","PanelStartExt(in)","PanelEndExt(in)",
             "Layers","WallCount","LevelElevations(in)",
-            # --- canonical facade basis for downstream scripts ---
             "wall_origin_x","wall_origin_y","wall_origin_z",
             "wall_dir_x","wall_dir_y","wall_dir_z",
             "wall_normal_x","wall_normal_y","wall_normal_z",
@@ -443,87 +293,56 @@ try:
         else:
             levels        = list(FilteredElementCollector(doc).OfClass(Level))
             level_elev_in = sorted([int(round(l.Elevation * 12)) for l in levels])
+            
+            _all_doc_walls = list(FilteredElementCollector(doc).OfClass(Wall).WhereElementIsNotElementType())
 
             for _gd in _group_data:
                 geo         = _gd['geo']
                 combined_id = _gd['id']
                 facade_id   = _gd['label']
-                grp_walls   = _gd['walls']
+                wall        = _gd['walls'][0]
 
-                # ---- Corner extension -----------------------------------------------
-                # Revit wall location-curve endpoints at building corners are inset from
-                # the outer corner by half the adjacent (perpendicular) wall's thickness.
-                # Detect adjacent walls at each endpoint and extend geo['start'] /
-                # geo['end'] so the facade spans to the true exterior corners.
-                _all_doc_walls = list(
-                    FilteredElementCollector(doc).OfClass(Wall).WhereElementIsNotElementType()
-                )
-                _facade_ids = {w.Id.IntegerValue for w in grp_walls}
-
-                def _corner_ext(endpoint, wall_dir, excl_ids):
-                    """Half-thickness of the first perpendicular wall found at endpoint."""
-                    _tol = 0.15     # ft ≈ 1.8" — generous for Revit join tolerances
+                # ---- Corner extension logic for individual walls ----
+                def _corner_ext(endpoint, wall_dir, excl_id):
+                    _tol = 0.15
                     _ext = 0.0
                     for _aw in _all_doc_walls:
-                        if _aw.Id.IntegerValue in excl_ids:
-                            continue
-                        try:
-                            _alc = _aw.Location.Curve
-                        except Exception:
-                            continue
+                        if _aw.Id.IntegerValue == excl_id: continue
+                        try: _alc = _aw.Location.Curve
+                        except: continue
                         for _k in [0, 1]:
                             _aep = _alc.GetEndPoint(_k)
-                            _d2d = XYZ(_aep.X - endpoint.X,
-                                       _aep.Y - endpoint.Y, 0.0).GetLength()
+                            _d2d = XYZ(_aep.X - endpoint.X, _aep.Y - endpoint.Y, 0.0).GetLength()
                             if _d2d < _tol:
-                                _adir = (_alc.GetEndPoint(1) -
-                                         _alc.GetEndPoint(0)).Normalize()
-                                # Perpendicular: |dot| < 0.25  (angle > ~76° from parallel)
+                                _adir = (_alc.GetEndPoint(1) - _alc.GetEndPoint(0)).Normalize()
                                 if abs(wall_dir.DotProduct(_adir)) < 0.25:
                                     _ext = max(_ext, _aw.WallType.Width / 2.0)
                     return _ext
 
-                _s_ext = _corner_ext(geo['start'], geo['direction'], _facade_ids)
-                _e_ext = _corner_ext(geo['end'],   geo['direction'], _facade_ids)
+                _s_ext = _corner_ext(geo['start'], geo['direction'], combined_id)
+                _e_ext = _corner_ext(geo['end'],   geo['direction'], combined_id)
 
-                if _s_ext > 0.0 or _e_ext > 0.0:
-                    # Do NOT move geo['start'] / geo['end'] — that shifts wall_origin
-                    # in the CSV and breaks the placement script's ALIGN computation
-                    # (ALIGN uses the Revit wall's geometry, not the CSV origin, as its
-                    # target, so moving wall_origin causes panels to overshoot).
-                    # Instead, export the extensions as separate columns so
-                    # panel_calculator can extend x_in values into the corner zone
-                    # while keeping wall_origin at the correct Revit location.
-                    print("  '{}' Corner ext: start +{:.3f}\" | end +{:.3f}\"".format(
-                          facade_id, _s_ext * 12, _e_ext * 12))
-                _panel_start_ext_in = round(_s_ext * 12, 4)
-                _panel_end_ext_in   = round(_e_ext * 12, 4)
-                # ---- End corner extension -------------------------------------------
+                _panel_start_ext_in = _s_ext * 12
+                _panel_end_ext_in   = _e_ext * 12
 
-                length_ft   = geo['start'].DistanceTo(geo['end'])
+                length_ft   = geo['length']
                 height_ft   = geo['height']
-
-                first_wall  = grp_walls[0]
-                width_ft    = first_wall.Width
-                wall_type   = doc.GetElement(first_wall.GetTypeId())
-                kind_name   = "Basic (Combined)"
+                width_ft    = wall.Width
+                wall_type   = doc.GetElement(wall.GetTypeId())
+                kind_name   = "Basic"
                 type_name   = getattr(wall_type, "Name", "") or ""
                 family_name = getattr(wall_type, "FamilyName", "") or ""
 
-                function_str = (get_param_val(first_wall, "Function", as_string=True) or
-                                get_param_val(first_wall, get_bip("WALL_ATTR_FUNCTION_PARAM"), as_string=True) or "")
-                is_struct    = bool(getattr(first_wall, "Structural", False))
+                function_str = (get_param_val(wall, "Function", as_string=True) or
+                                get_param_val(wall, get_bip("WALL_ATTR_FUNCTION_PARAM"), as_string=True) or "")
+                is_struct    = bool(getattr(wall, "Structural", False))
                 area_sf      = rnum(length_ft * height_ft)
                 vol_cf       = rnum(length_ft * height_ft * width_ft)
-                base_lvl     = level_name(first_wall)
-                base_off     = (get_param_val(first_wall, get_bip("WALL_BASE_OFFSET")) or
-                                get_param_val(first_wall, "Base Offset") or "")
-                top_con      = (get_param_val(first_wall, "Top Constraint", as_string=True) or
-                                get_param_val(first_wall, get_bip("WALL_HEIGHT_TYPE"), as_string=True) or "")
-                top_off      = (get_param_val(first_wall, get_bip("WALL_TOP_OFFSET")) or
-                                get_param_val(first_wall, "Top Offset") or "")
-                loc_line     = (get_param_val(first_wall, get_bip("WALL_KEY_REF_PARAM"), as_string=True) or
-                                get_param_val(first_wall, "Location Line", as_string=True) or "")
+                base_lvl     = level_name(wall)
+                base_off     = (get_param_val(wall, get_bip("WALL_BASE_OFFSET")) or get_param_val(wall, "Base Offset") or "")
+                top_con      = (get_param_val(wall, "Top Constraint", as_string=True) or get_param_val(wall, get_bip("WALL_HEIGHT_TYPE"), as_string=True) or "")
+                top_off      = (get_param_val(wall, get_bip("WALL_TOP_OFFSET")) or get_param_val(wall, "Top Offset") or "")
+                loc_line     = (get_param_val(wall, get_bip("WALL_KEY_REF_PARAM"), as_string=True) or get_param_val(wall, "Location Line", as_string=True) or "")
 
                 layers_info = []
                 try:
@@ -544,49 +363,35 @@ try:
                 layers_str = " || ".join(layers_info) if layers_info else "No Layers"
 
                 wall_normal_xyz = None
-                try:
-                    wall_normal_xyz = first_wall.Orientation
-                except Exception: pass
+                try: wall_normal_xyz = wall.Orientation
+                except: pass
 
                 struct_face_offset_ft = 0.0
                 try:
                     _cs = wall_type.GetCompoundStructure()
                     if _cs:
                         _ly = list(_cs.GetLayers())
-
-                        # FirstCoreLayerIndex / LastCoreLayerIndex are not available
-                        # in all Revit API versions.  Fall back to scanning layer
-                        # function names for the string "struct".
                         try:
                             _ci  = _cs.FirstCoreLayerIndex
                             _lci = _cs.LastCoreLayerIndex
                         except AttributeError:
-                            _ci  = next((i for i, l in enumerate(_ly)
-                                         if "struct" in str(l.Function).lower()), 0)
-                            _lci = next((i for i in range(len(_ly)-1, _ci-1, -1)
-                                         if "struct" in str(_ly[i].Function).lower()), _ci)
+                            _ci  = next((i for i, l in enumerate(_ly) if "struct" in str(l.Function).lower()), 0)
+                            _lci = next((i for i in range(len(_ly)-1, _ci-1, -1) if "struct" in str(_ly[i].Function).lower()), _ci)
 
                         _ext_nc = sum(_ly[i].Width for i in range(_ci))
                         _ll = str(loc_line).lower()
-                        if ("finish" in _ll or "face" in _ll) and "exterior" in _ll and "core" not in _ll:
-                            _loc_to_ext = 0.0
-                        elif "core" in _ll and "exterior" in _ll:
-                            _loc_to_ext = _ext_nc
+                        if ("finish" in _ll or "face" in _ll) and "exterior" in _ll and "core" not in _ll: _loc_to_ext = 0.0
+                        elif "core" in _ll and "exterior" in _ll: _loc_to_ext = _ext_nc
                         elif "core" in _ll and ("center" in _ll or "centre" in _ll):
                             _cw2 = sum(_ly[i].Width for i in range(_ci, _lci + 1))
                             _loc_to_ext = _ext_nc + _cw2 / 2.0
                         elif "core" in _ll and "interior" in _ll:
                             _cw2 = sum(_ly[i].Width for i in range(_ci, _lci + 1))
                             _loc_to_ext = _ext_nc + _cw2
-                        elif "interior" in _ll and ("finish" in _ll or "face" in _ll):
-                            _loc_to_ext = width_ft
-                        else:
-                            _loc_to_ext = width_ft / 2.0
+                        elif "interior" in _ll and ("finish" in _ll or "face" in _ll): _loc_to_ext = width_ft
+                        else: _loc_to_ext = width_ft / 2.0
                         struct_face_offset_ft = round(_loc_to_ext - _ext_nc, 6)
-                        print("    '{}' StructFaceOffset: {:.3f} in | ExtNonCore: {:.3f} in".format(
-                              facade_id, struct_face_offset_ft * 12, _ext_nc * 12))
-                except Exception as _sf_ex:
-                    print("  [WARN] '{}' Could not compute StructFaceOffset: {}".format(facade_id, _sf_ex))
+                except: pass
 
                 mid_pt = geo['start'] + (geo['direction'] * (length_ft / 2.0))
 
@@ -594,20 +399,19 @@ try:
                     combined_id, facade_id, kind_name, type_name, family_name, function_str, is_struct,
                     rnum(width_ft), rnum(length_ft), rnum(height_ft), area_sf, vol_cf,
                     base_lvl, rnum(base_off), top_con, rnum(top_off), loc_line,
-                    "Line (Combined)", xyz_str(geo['start']), xyz_str(geo['end']), xyz_str(mid_pt), rnum(length_ft),
+                    "Line", xyz_str(geo['start']), xyz_str(geo['end']), xyz_str(mid_pt), rnum(length_ft),
                     "", "", "", "", xyz_str(wall_normal_xyz) if wall_normal_xyz else "", rnum(struct_face_offset_ft),
                     rnum(_panel_start_ext_in), rnum(_panel_end_ext_in),
-                    layers_str, str(len(grp_walls)), json.dumps(level_elev_in)
+                    layers_str, "1", json.dumps(level_elev_in),
+                    rnum(geo['start'].X), rnum(geo['start'].Y), rnum(geo['start'].Z),
+                    rnum(geo['direction'].X), rnum(geo['direction'].Y), rnum(geo['direction'].Z),
+                    rnum(wall_normal_xyz.X) if wall_normal_xyz else "", rnum(wall_normal_xyz.Y) if wall_normal_xyz else "", rnum(wall_normal_xyz.Z) if wall_normal_xyz else "",
+                    rnum(PANEL_TOTAL_THICKNESS_IN), rnum(SHEATHING_THICKNESS_IN), rnum(STUD_DEPTH_IN)
                 ])
 
-                print("  Facade '{}': {} walls | {:.2f} ft × {:.2f} ft | id={}".format(
-                      facade_id, len(grp_walls), rnum(length_ft, 2), rnum(height_ft, 2), combined_id))
-                _loc_lower = str(loc_line).lower()
-                if not ("finish exterior" in _loc_lower or
-                        ("finish" in _loc_lower and "exterior" in _loc_lower)):
-                    print("  [WARN] '{}' Location Line is '{}', not 'Finish Exterior'. "
-                          "Corner endpoints may be inset.".format(facade_id, loc_line))
-
+                print("  Wall '{}': {:.2f} ft × {:.2f} ft | id={}".format(
+                      facade_id, rnum(length_ft, 2), rnum(height_ft, 2), combined_id))
+                
     print("Walls exported successfully to: {}".format(WALLS_PATH))
 
 except IOError as e:
@@ -658,10 +462,12 @@ for _bwall in basic_walls:
                     if str(_dep.WallType.Kind).lower() == "curtain":
                         curtain_walls_hosted.append(_dep)
                         _seen_cw_ids.add(_dep_id.IntegerValue)
+                        # Map this curtain wall directly to its parent basic wall ID
+                        _wall_to_group[_dep_id.IntegerValue] = _wall_to_group[_bwall.Id.IntegerValue]
                 except Exception: pass
     except Exception: pass
 
-# Register Scenario-A curtain walls in _wall_to_group (by geometric proximity)
+# Final fallback for unbound curtain walls
 for _cw in curtain_walls_hosted:
     if _cw.Id.IntegerValue not in _wall_to_group:
         _gd_match = find_group_for_opening(_cw, _group_data, _wall_to_group)
@@ -691,15 +497,13 @@ try:
             for opening in all_openings_list:
                 try:
                     opening_id = opening.Id.IntegerValue
-                    # Route opening to its facade
                     _gd          = find_group_for_opening(opening, _group_data, _wall_to_group)
                     geo          = _gd['geo']
                     combined_id  = _gd['id']
                     _cwall_elem  = doc.GetElement(ElementId(combined_id))
-                    host_wall_type = (getattr(doc.GetElement(_cwall_elem.GetTypeId()), "Name", "")
-                                      if _cwall_elem else "")
+                    host_wall_type = (getattr(doc.GetElement(_cwall_elem.GetTypeId()), "Name", "") if _cwall_elem else "")
 
-                    # ---- Curtain Wall / Storefront ----------------------------------------
+                    # ---- Curtain Wall / Storefront ----
                     if isinstance(opening, Wall):
                         _cw_type      = doc.GetElement(opening.GetTypeId())
                         _cw_type_name = getattr(_cw_type, "Name", "") or ""
@@ -712,8 +516,7 @@ try:
                         _right_ft = max(_d0, _d1)
                         _w_ft = _lc.Length
                         _h_ft = 0.0
-                        for _hbip in [BuiltInParameter.WALL_USER_HEIGHT_PARAM,
-                                      BuiltInParameter.WALL_ATTR_HEIGHT_PARAM]:
+                        for _hbip in [BuiltInParameter.WALL_USER_HEIGHT_PARAM, BuiltInParameter.WALL_ATTR_HEIGHT_PARAM]:
                             try:
                                 _hp = opening.get_Parameter(_hbip)
                                 if _hp:
@@ -721,12 +524,16 @@ try:
                                     if _hv and _hv > 0:
                                         _h_ft = _hv
                                         break
-                            except Exception: pass
-                        if _w_ft <= 0 or _h_ft <= 0:
-                            print("  [WARN] Curtain wall {} ({}): W={} H={} -- skipping.".format(
-                                  opening_id, _cw_type_name, rnum(_w_ft), rnum(_h_ft)))
-                            continue
-                        _base_z = min(_p0.Z, _p1.Z)
+                            except: pass
+                        if _w_ft <= 0 or _h_ft <= 0: continue
+                        
+                        _base_off = 0.0
+                        try:
+                            _bop = opening.get_Parameter(BuiltInParameter.WALL_BASE_OFFSET)
+                            if _bop: _base_off = _bop.AsDouble()
+                        except: pass
+                        
+                        _base_z = min(_p0.Z, _p1.Z) + _base_off
                         _sill_ft = _base_z - geo['min_z']
                         _center  = (_left_ft + _right_ft) / 2.0
                         _mid_xy  = _lc.Evaluate(0.5, True)
@@ -745,20 +552,21 @@ try:
                             "", "", _mark, _comments, rnum(_w_ft * _h_ft)
                         ])
                         continue
-                    # ---- End Curtain Wall -------------------------------------------------
 
+                    # ---- Standard Doors / Windows ----
                     category          = opening.Category.Name if opening.Category else ""
                     opening_type_elem = doc.GetElement(opening.GetTypeId())
                     type_name         = getattr(opening_type_elem, "Name", "") or ""
-                    family_name       = (getattr(opening_type_elem, "FamilyName", "")
-                                         if hasattr(opening_type_elem, "FamilyName") else "")
+                    family_name       = (getattr(opening_type_elem, "FamilyName", "") if hasattr(opening_type_elem, "FamilyName") else "")
                     loc_pt = opening.Location.Point if hasattr(opening.Location, "Point") else XYZ(0,0,0)
+                    
+                    # Because geo['start'] is now the specific wall's start, this math is perfectly local
                     dist_along = (loc_pt - geo['start']).DotProduct(geo['direction'])
 
                     def _get_dim(elem, bips, names):
                         sources = [elem]
                         try: sources.append(doc.GetElement(elem.GetTypeId()))
-                        except Exception: pass
+                        except: pass
                         for src in sources:
                             if src is None: continue
                             for bip in bips:
@@ -767,34 +575,25 @@ try:
                                     if p:
                                         v = p.AsDouble()
                                         if v and v > 0: return v
-                                except Exception: pass
+                                except: pass
                             for nm in names:
                                 try:
                                     p = src.LookupParameter(nm)
                                     if p:
                                         v = p.AsDouble()
                                         if v and v > 0: return v
-                                except Exception: pass
+                                except: pass
                         return 0.0
 
-                    WIDTH_BIPS  = [BuiltInParameter.DOOR_WIDTH,  BuiltInParameter.WINDOW_WIDTH,
-                                   BuiltInParameter.GENERIC_WIDTH, BuiltInParameter.FAMILY_WIDTH_PARAM]
-                    HEIGHT_BIPS = [BuiltInParameter.DOOR_HEIGHT, BuiltInParameter.WINDOW_HEIGHT,
-                                   BuiltInParameter.GENERIC_HEIGHT, BuiltInParameter.FAMILY_HEIGHT_PARAM]
-                    WIDTH_NAMES  = ["Width","Rough Width","Nominal Width","Opening Width",
-                                    "Frame Width","Clear Width","w","WIDTH"]
-                    HEIGHT_NAMES = ["Height","Rough Height","Nominal Height","Opening Height",
-                                    "Frame Height","Clear Height","Unconnected Height","h","HEIGHT"]
+                    WIDTH_BIPS  = [BuiltInParameter.DOOR_WIDTH,  BuiltInParameter.WINDOW_WIDTH, BuiltInParameter.GENERIC_WIDTH, BuiltInParameter.FAMILY_WIDTH_PARAM]
+                    HEIGHT_BIPS = [BuiltInParameter.DOOR_HEIGHT, BuiltInParameter.WINDOW_HEIGHT, BuiltInParameter.GENERIC_HEIGHT, BuiltInParameter.FAMILY_HEIGHT_PARAM]
+                    WIDTH_NAMES  = ["Width","Rough Width","Nominal Width","Opening Width","Frame Width","Clear Width","w","WIDTH"]
+                    HEIGHT_NAMES = ["Height","Rough Height","Nominal Height","Opening Height","Frame Height","Clear Height","Unconnected Height","h","HEIGHT"]
 
                     w_ft = _get_dim(opening, WIDTH_BIPS, WIDTH_NAMES)
                     h_ft = _get_dim(opening, HEIGHT_BIPS, HEIGHT_NAMES)
 
-                    if w_ft <= 0 or h_ft <= 0:
-                        print("  [WARN] Opening {} ({}): could not read W={} H={} -- "
-                              "check family parameter names.".format(
-                              opening.Id.IntegerValue,
-                              getattr(doc.GetElement(opening.GetTypeId()), "Name", "?"),
-                              w_ft, h_ft))
+                    if w_ft <= 0 or h_ft <= 0: continue
                     thk_ft        = get_param_val(opening, "Thickness")
                     left_edge_ft  = dist_along - (w_ft / 2.0)
                     right_edge_ft = dist_along + (w_ft / 2.0)
@@ -842,7 +641,7 @@ except Exception as e:
 
 # ========== SUMMARY ==========
 print("\n" + "=" * 70)
-print("FACADE EXPORT COMPLETE")
+print("WALL-BY-WALL EXPORT COMPLETE")
 print("=" * 70)
 print("Walls CSV:    {}".format(WALLS_PATH))
 print("Openings CSV: {}".format(OPENINGS_PATH))

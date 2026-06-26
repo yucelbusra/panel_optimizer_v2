@@ -333,10 +333,13 @@ def set_void_parameters_for_cutouts(inst, panel_data):
         c = cutouts[0]
         unit_w_in   = max(_safe_float(c.get("raw_width_in",  c.get("width_in",  0))), MIN_VOID_DIMENSION_IN)
         unit_h_in   = max(_safe_float(c.get("raw_height_in", c.get("height_in", 0))), MIN_VOID_DIMENSION_IN)
-        
+
+
         raw_x_in    = _safe_float(c.get("raw_x_in", c.get("x_in", 0)))
-        # MIRROR THE X OFFSET: panel is rotated 180 deg, so family's internal "Left" is physical "Right"
+        # RESTORE MIRROR MATH: The panel is rotated 180 to face exterior, so its internal axes are flipped.
         x_offset_in = max(0.0, panel_w_in - unit_w_in - raw_x_in)
+        
+
         
         y_offset_in = _safe_float(c.get("raw_y_in", c.get("y_in", 0)))
         jamb_clr_in, head_clr_in, sill_clr_in = _get_clearances(c)
@@ -369,10 +372,12 @@ def set_void_parameters_for_cutouts(inst, panel_data):
         c2 = cutouts[1]
         unit_w2_in   = max(_safe_float(c2.get("raw_width_in",  c2.get("width_in",  0))), MIN_VOID_DIMENSION_IN)
         unit_h2_in   = max(_safe_float(c2.get("raw_height_in", c2.get("height_in", 0))), MIN_VOID_DIMENSION_IN)
-        
+
         raw_x2_in    = _safe_float(c2.get("raw_x_in", c2.get("x_in", 0)))
-        # MIRROR THE X OFFSET: panel is rotated 180 deg, so family's internal "Left" is physical "Right"
+        # RESTORE MIRROR MATH
         x2_offset_in = max(0.0, panel_w_in - unit_w2_in - raw_x2_in)
+
+        
         
         y2_offset_in = _safe_float(c2.get("raw_y_in", c2.get("y_in", 0)))
         jamb2_clr_in, head2_clr_in, sill2_clr_in = _get_clearances(c2)
@@ -436,10 +441,8 @@ def _get_csv_origin_and_dir(panel, fallback_wall=None):
     return None, None
 
 def _panel_solid_span_along_dir(inst, direction):
-    """Project the panel's MAIN solid (largest by volume) onto `direction`.
-    Returns (min_proj, max_proj) in feet. Uses visible solids only and the
-    largest body, so finish-extent / void / reference geometry that pollutes
-    the world-AABB is ignored. Geometry is post-placement+rotation already."""
+    """Project the panel's solid geometry onto `direction`.
+    Returns (min_proj, max_proj) in feet. Uses visible solids only. Geometry is post-placement+rotation already."""
     from Autodesk.Revit.DB import Options, Solid, GeometryInstance, ViewDetailLevel
     opt = Options()
     opt.IncludeNonVisibleObjects = False
@@ -466,15 +469,17 @@ def _panel_solid_span_along_dir(inst, direction):
     if not solids:
         return None, None
 
-    body = max(solids, key=lambda s: s.Volume)   # main panel body
+    # FIX: Do not isolate the single largest body. A storefront cutout can split the
+    # panel into two disjoint legs. We must measure the span of ALL solid parts together.
     vals = []
-    for edge in body.Edges:
-        try:
-            c = edge.AsCurve()
-            vals.append(c.GetEndPoint(0).DotProduct(direction))
-            vals.append(c.GetEndPoint(1).DotProduct(direction))
-        except:
-            pass
+    for s in solids:
+        for edge in s.Edges:
+            try:
+                c = edge.AsCurve()
+                vals.append(c.GetEndPoint(0).DotProduct(direction))
+                vals.append(c.GetEndPoint(1).DotProduct(direction))
+            except:
+                pass
     if not vals:
         return None, None
     return min(vals), max(vals)
