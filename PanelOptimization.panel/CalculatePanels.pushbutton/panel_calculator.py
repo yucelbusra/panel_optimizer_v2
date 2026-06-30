@@ -26,6 +26,7 @@ class Ansi(object):
 
 # Global active configuration (used for orientation & constraints)
 ACTIVE_CONFIG = None
+LAST_RUN_STATS = {"np": 0, "nu": 0}  # building-wide counts from last process_all_walls
 
 # =============================================================================
 # SECTION 1: DATA STRUCTURES & BASIC CONFIGURATION
@@ -167,7 +168,10 @@ class OptimizationStrategy(object):
                  panel_orientation="vertical", minimize_unique_panels=False, 
                  use_ga_optimizer=False,
                  cutout_tolerance=0.0, opening_alignment="opening_derived", 
-                 void1_x_offset_left=6.0, nonwindow_strategy="largest"):
+                 void1_x_offset_left=6.0, nonwindow_strategy="largest",
+                 np_weight=1.0, nu_weight=10.0,
+                 best_to_manufacture=False, unique_weight=10.0,
+                 merge_tolerance_in=0.0):
         
         self.prioritize_coverage       = bool(prioritize_coverage)
         self.allow_vertical_stacking   = bool(allow_vertical_stacking)
@@ -180,6 +184,11 @@ class OptimizationStrategy(object):
         self.opening_alignment         = str(opening_alignment)
         self.void1_x_offset_left       = float(void1_x_offset_left)
         self.nonwindow_strategy        = str(nonwindow_strategy)
+        self.np_weight                 = float(np_weight)
+        self.nu_weight                 = float(nu_weight)
+        self.best_to_manufacture       = bool(best_to_manufacture)
+        self.unique_weight             = float(unique_weight)
+        self.merge_tolerance_in        = float(merge_tolerance_in)
 
 class OptimizerConfig(object):
     def __init__(self, project_name="Default Project", panel_constraints=None,
@@ -240,7 +249,12 @@ class OptimizerConfig(object):
                 "cutout_tolerance": os.cutout_tolerance,
                 "opening_alignment": os.opening_alignment,
                 "void1_x_offset_left": os.void1_x_offset_left,
-                "nonwindow_strategy": os.nonwindow_strategy
+                "nonwindow_strategy": os.nonwindow_strategy,
+                "best_to_manufacture": getattr(os, "best_to_manufacture", False),
+                "unique_weight": getattr(os, "unique_weight", 10.0),
+                "np_weight": getattr(os, "np_weight", 1.0),
+                "nu_weight": getattr(os, "nu_weight", 10.0),
+                "merge_tolerance_in": getattr(os, "merge_tolerance_in", 0.0)
             }
         }
 
@@ -267,7 +281,7 @@ class OptimizerConfig(object):
             ),
             window_clearances=OpeningClearances(
                 rough_jamb=wc.get("rough_jamb", 0.5), rough_header=wc.get("rough_header", 0.5), rough_sill=wc.get("rough_sill", 0.5),
-                panel_jamb=wc.panel_jamb, panel_header=wc.get("panel_header", 7.5), panel_sill=wc.get("panel_sill", 5.5)
+                panel_jamb=wc.get("panel_jamb", 5.5), panel_header=wc.get("panel_header", 7.5), panel_sill=wc.get("panel_sill", 5.5)
             ),
             storefront_clearances=OpeningClearances(
                 rough_jamb=sc.get("rough_jamb", 0.5), rough_header=sc.get("rough_header", 0.5), rough_sill=sc.get("rough_sill", 0.0),
@@ -288,7 +302,12 @@ class OptimizerConfig(object):
                 cutout_tolerance=os_.get("cutout_tolerance", 0.0),
                 opening_alignment=os_.get("opening_alignment", "opening_derived").replace("as_placed", "opening_derived").replace("fixed_offset", "set_x_offset"),
                 void1_x_offset_left=os_.get("void1_x_offset_left", os_.get("fixed_offset_in", 6.0)),
-                nonwindow_strategy=os_.get("nonwindow_strategy", "largest")
+                nonwindow_strategy=os_.get("nonwindow_strategy", "largest"),
+                np_weight=os_.get("np_weight", 1.0),
+                nu_weight=os_.get("nu_weight", os_.get("unique_weight", 10.0)),
+                best_to_manufacture=os_.get("best_to_manufacture", False),
+                unique_weight=os_.get("unique_weight", 10.0),
+                merge_tolerance_in=os_.get("merge_tolerance_in", 0.0)
             )
         )
 
@@ -585,42 +604,52 @@ def adjust_panels_for_small_openings(panels, openings, constraints, dim_inc):
             right.x = float(new_right_x)
             right.w = float(new_right_fab_w)
             break
-def evaluate_manufacturing_score(panels, constraints):
+def evaluate_manufacturing_score(panels, constraints, weight):
     """
-    Calculates the DfMA manufacturing score for a given panel layout.
-    Lower is better.
+    Calculates the DfMA manufacturing score dynamically based on user weight.
+    Recognizes Left-Hand (LH) and Right-Hand (RH) mirrored panels as a single unique type!
     """
     if not panels:
         return (9999, 9999, {"panels": 0, "unique": 0})
 
     total_panels = len(panels)
     
-    # Calculate Unique Panel Types (Fabrication complexity)
     unique_signatures = set()
     for p in panels:
-        # Round dimensions to 1/8" to group panels with microscopic floating-point differences
         sig_w = round(p.w * 8.0) / 8.0
         sig_h = round(p.h * 8.0) / 8.0
         
-        # Cutout signature (A panel with a hole is fabricated differently than a solid one)
-        cutouts = []
-        for c in getattr(p, 'cutouts', []):
-            cutouts.append((round(c['width_in'], 1), round(c['height_in'], 1)))
-        cutouts.sort()
+        std_cutouts = []
+        mir_cutouts = []
         
-        unique_signatures.add((sig_w, sig_h, tuple(cutouts)))
+        for c in getattr(p, 'cutouts', []):
+            cx = round(c['x_in'], 1)
+            cy = round(c['y_in'], 1)
+            cw = round(c['width_in'], 1)
+            ch = round(c['height_in'], 1)
+            
+            std_cutouts.append((cx, cy, cw, ch))
+            
+            # Calculate the mathematically mirrored X position
+            mir_x = round(p.w - c['x_in'] - c['width_in'], 1)
+            mir_cutouts.append((mir_x, cy, cw, ch))
+            
+        std_cutouts.sort()
+        mir_cutouts.sort()
+        
+        std_sig = (sig_w, sig_h, tuple(std_cutouts))
+        mir_sig = (sig_w, sig_h, tuple(mir_cutouts))
+        
+        canonical_sig = min(std_sig, mir_sig)
+        unique_signatures.add(canonical_sig)
         
     unique_types = len(unique_signatures)
-
-    # --- NEW SCORING HIERARCHY ---
+    
     # Score = Total Panels + (Unique Types * User Weight)
     primary_score = total_panels + (unique_types * weight)
-    
-    # Tie-breaker is the Total Panels
     tie_breaker = total_panels
     
     return (primary_score, tie_breaker, {"panels": total_panels, "unique": unique_types})
-    
 
 # =============================================================================
 # SECTION 3: COLLISION DETECTION
@@ -797,6 +826,92 @@ def fill_vertical_gap(region_x_start, region_x_end, gap_y_start, gap_y_end,
     return panel_counter
 
 
+def _equalize_sibling_panels(panels, openings, constraints):
+    """ROOT-CAUSE drift fix (Option 1: sibling equalization).
+
+    The sequential tiler snaps the first panel of an evenly-divided region down
+    to the increment and dumps the leftover onto the LAST panel, so two halves
+    that should be identical come out e.g. 305.000 + 305.625. This pass finds
+    runs of consecutive, same-band, same-cutout-count panels and re-flows them
+    to EXACTLY equal widths (covering the same span, spacing preserved), then
+    recomputes their cutouts. It only commits when doing so genuinely reduces
+    the number of distinct panel types in the run AND no new seam lands inside
+    an opening's clearance zone. Otherwise it leaves the run untouched -- so it
+    can never create a gap, an overlap, or a seam through a window.
+    """
+    from collections import defaultdict
+    spacing = float(getattr(constraints, "panel_spacing", 0.0) or 0.0)
+
+    bands = defaultdict(list)
+    for p in panels:
+        bands[(round(p.y, 3), round(p.h, 3))].append(p)
+
+    for _key, bp in bands.items():
+        bp.sort(key=lambda p: p.x)
+        n = len(bp)
+        i = 0
+        while i < n:
+            cc = len(getattr(bp[i], "cutouts", []) or [])
+            j = i + 1
+            while j < n:
+                prev, cur = bp[j - 1], bp[j]
+                contiguous = abs((prev.x + prev.w + spacing) - cur.x) < 0.2
+                same_cc = len(getattr(cur, "cutouts", []) or []) == cc
+                if contiguous and same_cc:
+                    j += 1
+                else:
+                    break
+            if (j - i) >= 2:
+                _try_equalize_run(bp[i:j], openings, constraints)
+            i = j
+    return panels
+
+
+def _try_equalize_run(run, openings, constraints):
+    """Attempt to give every panel in `run` the same exact width. Commits only
+    if it strictly lowers the distinct-type count of the run and stays seam-safe."""
+    spacing = float(getattr(constraints, "panel_spacing", 0.0) or 0.0)
+    N = len(run)
+    x0 = run[0].x
+    span = (run[-1].x + run[-1].w) - x0
+    W = (span - (N - 1) * spacing) / float(N)
+    if W < constraints.min_width:
+        return
+
+    _lib = PanelLibrary()
+    before = set()
+    for p in run:
+        canon, _m = _lib._signature(p.w, p.h, getattr(p, "cutouts", []) or [])
+        before.add(canon)
+
+    # Build the tentative equalized layout.
+    tentative = []
+    cx = x0
+    for _k in range(N):
+        q = Panel(round(cx, 6), run[0].y, round(W, 6), run[0].h)
+        q.cutouts = calculate_panel_cutouts(q, openings)
+        tentative.append(q)
+        cx += W + spacing
+
+    # Seam safety: no interior seam may fall inside an opening's clearance zone.
+    for k in range(N - 1):
+        seam = tentative[k].x + tentative[k].w
+        for o in openings:
+            if o.left_clearance_zone - 0.01 < seam < o.right_clearance_zone + 0.01:
+                return
+
+    after = set()
+    for q in tentative:
+        canon, _m = _lib._signature(q.w, q.h, q.cutouts)
+        after.add(canon)
+
+    if len(after) < len(before):
+        for old, q in zip(run, tentative):
+            old.x = q.x
+            old.w = q.w
+            old.cutouts = q.cutouts
+
+
 def calculate_segment_layout(start_x, target_x, max_w, min_w, inc, spacing):
     total_dist = target_x - start_x
     
@@ -806,17 +921,16 @@ def calculate_segment_layout(start_x, target_x, max_w, min_w, inc, spacing):
     if total_dist <= max_w: 
         return snap_down(total_dist, inc)
     
-    # FIX: Check if taking the maximum greedy width leaves a tiny "splinter" panel
-    leftover = total_dist - max_w - spacing
-    if 0 < leftover < min_w:
-        # Splinter alert! 
-        # Instead of max_w, split the remaining distance equally to generate 
-        # two identically-sized standard panels that are larger than min_w.
-        half_width = (total_dist - spacing) / 2.0
-        return snap_down(half_width, inc)
-        
-    # GREEDY: Place largest possible panel first
-    return snap_down(max_w, inc)
+    # --- THE ANTI-SPLINTER EQUALIZER ---
+    # Instead of being greedy (e.g., 30ft gap = 24ft max + 6ft splinter),
+    # we divide the long gap evenly to drastically reduce unique types! 
+    # (e.g., 30ft gap = 15ft + 15ft identical twins)
+    import math
+    n_panels = math.ceil((total_dist + spacing) / (max_w + spacing))
+    optimal_w = (total_dist - (n_panels - 1) * spacing) / n_panels
+    
+    return snap_down(optimal_w, inc)
+
 
 def place_panels_sequential(wall_width, wall_height, openings, constraints, orientation="vertical"):
     """
@@ -914,14 +1028,18 @@ def _core_place_panels_sequential(wall_width, wall_height, openings, constraints
             bands = [(region['y_start'], region['y_end'])]
 
         for y_start, y_end in bands:
-            band_height = y_end - y_start
+            # --- FIX: VERTICAL SPACING ---
+            # Subtract spacing from the band height to create the Y-axis reveal!
+            raw_h = y_end - y_start
+            band_height = raw_h - spacing if (raw_h - spacing) >= PANEL_HEIGHT_MIN else raw_h
+            
             max_width_for_band = SHORT_MAX if band_height > SHORT_MAX else LONG_MAX
             x_cursor = max(0.0, region['x_start'])
 
             while x_cursor < region['x_end']:
                 remaining_wall = region['x_end'] - x_cursor
 
-                # [FIX] Widen last panel to absorb end-of-wall remainders
+                # Widen last panel to absorb end-of-wall remainders
                 if remaining_wall > 0 and remaining_wall < PANEL_WIDTH_MIN:
                     band_panels = [p for p in panels if abs(p.y - y_start) < 0.01]
                     if band_panels:
@@ -930,19 +1048,17 @@ def _core_place_panels_sequential(wall_width, wall_height, openings, constraints
                         if extended_w <= max_width_for_band:
                             last.w = extended_w
                             last.cutouts = calculate_panel_cutouts(last, region_openings)
-                            print("    [FIX] Widened {} to {:.3f}\" to absorb remainder".format(last.name, extended_w))
                         else:
                             snap_w = round(remaining_wall, 8)
                             candidate = Panel(x_cursor, y_start, snap_w, band_height, "P{:02d}".format(panel_counter))
                             candidate.cutouts = calculate_panel_cutouts(candidate, region_openings)
                             panels.append(candidate)
                             panel_counter += 1
-                            print("    [FIX] Placed narrow end panel {:.3f}\"".format(snap_w))
                     break
 
                 if remaining_wall < PANEL_WIDTH_MIN: break
 
-                # --- FIX: Prevent swallowing Storefronts/Doors ---
+                # Prevent swallowing Storefronts/Doors
                 future_openings = [
                     o for o in region_openings
                     if (o.right_clearance_zone > x_cursor + 0.01)
@@ -979,6 +1095,22 @@ def _core_place_panels_sequential(wall_width, wall_height, openings, constraints
                 panel_w = calculate_segment_layout(x_cursor, hard_stop_x, max_width_for_band, PANEL_WIDTH_MIN, DIMENSION_INCREMENT, spacing)
                 candidate_right = x_cursor + panel_w
                 
+                # --- FIX: MAX 2 CUTOUTS LIMIT ---
+                # Prevent panels from swallowing more windows than the Revit family can physically cut
+                contained_openings = [
+                    o for o in region_openings 
+                    if o.right_clearance_zone > x_cursor and o.left_clearance_zone < candidate_right
+                    and not (o.top_clearance_zone <= y_start or o.bottom_clearance_zone >= y_end)
+                    and is_cutout_opening(o, constraints)
+                ]
+                
+                if len(contained_openings) > 2:
+                    # Shrink panel width to stop safely before the 3rd opening
+                    third_op = contained_openings[2]
+                    safe_w = third_op.left_clearance_zone - x_cursor
+                    panel_w = snap_down(safe_w, DIMENSION_INCREMENT)
+                    candidate_right = x_cursor + panel_w
+
                 # Check for jamb clashes and adjust
                 for op in region_openings:
                     if (op.left_clearance_zone + 0.1) < candidate_right < (op.right_clearance_zone - 0.1):
@@ -995,9 +1127,6 @@ def _core_place_panels_sequential(wall_width, wall_height, openings, constraints
                 if not is_valid_panel(panel_w, band_height, constraints): break
 
                 candidate = Panel(x_cursor, y_start, panel_w, band_height, "P{:02d}".format(panel_counter))
-                if panel_overlaps_clearance(candidate, region_openings, constraints, allow_intentional=False):
-                    print("    [WARN] Panel overlaps hard clearance")
-
                 candidate.cutouts = calculate_panel_cutouts(candidate, region_openings)
                 panels.append(candidate)
                 panel_counter += 1
@@ -1076,45 +1205,45 @@ def _core_place_panels_sequential(wall_width, wall_height, openings, constraints
 
     
 def _place_ga_optimized(wall_width, wall_height, openings, constraints, orientation, strategy):
-    """
-    Placement engine for the Genetic Algorithm strategy.
-    Runs the GA to find the optimal sequence, then converts that sequence 
-    into physical Panel objects that respect your opening clearances.
-    """
-    print(Ansi.MAGENTA + "  [GA] Solving for optimal layout using GA sequence..." + Ansi.RESET)
+    print(Ansi.MAGENTA + "  [EXECUTE] Solving for Min Total + Unique (GA)..." + Ansi.RESET)
     
-    # 1. Run the GA to get the "Winning Chromosome" 
-    # FIX: Remove 'openings' and add 'strategy' to match the new solve_with_ga definition
-    best_sequence = solve_with_ga(wall_width, constraints, strategy)
-    
+    best_sequence = solve_with_ga(wall_width, constraints, strategy, openings)
     panels = []
     panel_counter = 1
     x_cursor = 0.0
     spacing = constraints.panel_spacing
     
-    # 2. Convert the GA widths into Panel objects
+    min_w = constraints.min_width
+    max_w = constraints.max_width
+
+    # 2. Convert the GA widths into Panel objects (clamp, never silently drop)
     for w in best_sequence:
-        # Safety check: stop if the GA sequence is longer than the wall
-        if x_cursor + w > wall_width:
+        remaining = wall_width - x_cursor
+        if remaining < min_w:
             break
-            
-        # Create the panel
-        p = Panel(x_cursor, 0, w, wall_height, "PGA{:02d}".format(panel_counter))
-        
-        # 3. Calculate cutouts (this uses your existing clearance/opening logic)
-        # This ensures that even though the GA chose the width, the cutouts
-        # remain correctly positioned relative to the window openings.
+        actual_w = w if (x_cursor + w) <= wall_width else remaining  # clamp last
+        p = Panel(x_cursor, 0, actual_w, wall_height, "PGA{:02d}".format(panel_counter))
         p.cutouts = calculate_panel_cutouts(p, openings)
-        
         panels.append(p)
         panel_counter += 1
-        x_cursor += (w + spacing)
-        
-    print(Ansi.GREEN + "  [GA] Successfully placed {} GA-optimized panels."
-          .format(len(panels)) + Ansi.RESET)
-        
-    return panels
+        x_cursor += (actual_w + spacing)
 
+    # 2b. If the GA undershot, tile the remaining tail so the wall is fully covered
+    while (wall_width - x_cursor) >= min_w:
+        remaining = wall_width - x_cursor
+        actual_w = remaining if remaining <= max_w else max_w
+        # avoid leaving a sub-min sliver behind
+        if 0 < (remaining - actual_w) < min_w:
+            actual_w = remaining - min_w
+        p = Panel(x_cursor, 0, actual_w, wall_height, "PGA{:02d}".format(panel_counter))
+        p.cutouts = calculate_panel_cutouts(p, openings)
+        panels.append(p)
+        panel_counter += 1
+        x_cursor += (actual_w + spacing)
+        
+    print(Ansi.GREEN + "  [EXECUTE] Successfully placed {} panels."
+          .format(len(panels)) + Ansi.RESET)
+    return panels
 
     
 def calculate_panel_cutouts(panel, openings):
@@ -1181,8 +1310,11 @@ def calculate_panel_cutouts(panel, openings):
     return cutouts
 
 
-def solve_with_ga(zone_len, constraints, strategy):
+def solve_with_ga(zone_len, constraints, strategy, openings=None):
     import random
+    # Deterministic per-zone seed: identical input -> identical output
+    # (reproducible tournament/GA runs), while different zones still differ.
+    random.seed(int(round(zone_len * 1000.0)))
     
     POP_SIZE = 50
     # Bumped slightly to give the GA time to find the right length
@@ -1198,19 +1330,31 @@ def solve_with_ga(zone_len, constraints, strategy):
     valid_widths = list(range(min_w, max_w + inc, inc))
     if not valid_widths: valid_widths = [min_w]
 
-    # Read the dynamic weight from the UI (defaults to 10.0 if not found)
-    user_weight = getattr(strategy, 'unique_weight', 10.0)
+    # Two weights: np (total panels) and nu (unique types). Fall back to the
+    # legacy single weight if the new ones aren't present.
+    np_w = getattr(strategy, 'np_weight', 1.0)
+    nu_w = getattr(strategy, 'nu_weight', getattr(strategy, 'unique_weight', 10.0))
 
     def fitness(chromosome):
         total_panels = len(chromosome)
         unique_types = len(set(chromosome))
-        
-        length_penalty = abs(zone_len - sum(chromosome)) * 100.0 
-        
-        # --- NEW DYNAMIC FITNESS ---
-        # Evaluates exactly based on the user's UI input
-        score = (unique_types * user_weight) + total_panels + length_penalty
-        
+
+        length_penalty = abs(zone_len - sum(chromosome)) * 100.0
+
+        # Opening-aware: penalize interior seams that fall inside an opening's
+        # clearance zone (a panel break across a window is bad fabrication).
+        seam_penalty = 0.0
+        if openings:
+            x = 0.0
+            for w in chromosome[:-1]:
+                x += w
+                for o in openings:
+                    if o.left_clearance_zone < x < o.right_clearance_zone:
+                        seam_penalty += 50.0
+                        break
+                x += constraints.panel_spacing
+
+        score = (nu_w * unique_types) + (np_w * total_panels) + length_penalty + seam_penalty
         return score
 
     # 1. Generate initial population with length variance
@@ -1251,213 +1395,6 @@ def solve_with_ga(zone_len, constraints, strategy):
 
     population.sort(key=fitness)
     return population[0] # Return the best sequence
-
-def _cutout_fingerprint(cutout):
-    """
-    Exact hashable fingerprint for one cutout using raw opening dimensions.
-    Uses raw_x_in/raw_y_in (opening position) and raw_width_in/raw_height_in
-    (opening size) when available, falling back to cutout box values.
-    All values rounded to 4 decimal places to avoid floating point noise.
-    """
-    x = round(float(cutout.get("raw_x_in",  cutout.get("x_in",      0))), 4)
-    y = round(float(cutout.get("raw_y_in",  cutout.get("y_in",      0))), 4)
-    w = round(float(cutout.get("raw_width_in",  cutout.get("width_in",  0))), 4)
-    h = round(float(cutout.get("raw_height_in", cutout.get("height_in", 0))), 4)
-    return (x, y, w, h)
-
-
-def _opening_size_key(cutout):
-    """Key based only on opening SIZE (not position) — used for grouping by opening type."""
-    w = round(float(cutout.get("raw_width_in",  cutout.get("width_in",  0))), 4)
-    h = round(float(cutout.get("raw_height_in", cutout.get("height_in", 0))), 4)
-    return (w, h)
-
-
-def _panel_type_key(panel, alignment):
-    """
-    Hashable key for grouping panels into fabrication types.
-    UPDATED: Includes Mirror-Symmetry detection. Left-offset and 
-    Right-offset equivalents will now group as the exact same type.
-    """
-    bw = round(float(panel.w), 4)
-    bh = round(float(panel.h), 4)
-
-    if alignment == "as_placed":
-        # 1. Standard orientation cuts
-        cuts = sorted(
-            [_cutout_fingerprint(c) for c in panel.cutouts],
-            key=lambda t: (-t[1], t[0])
-        )
-        
-        # 2. Mirrored orientation cuts (Flipped across panel width)
-        mirrored_cuts = []
-        for c in panel.cutouts:
-            w = round(float(c.get("raw_width_in", c.get("width_in", 0))), 4)
-            x = round(float(c.get("raw_x_in", c.get("x_in", 0))), 4)
-            y = round(float(c.get("raw_y_in", c.get("y_in", 0))), 4)
-            h = round(float(c.get("raw_height_in", c.get("height_in", 0))), 4)
-            
-            # The mathematical mirror: (Panel Width) - (Cutout X) - (Cutout Width)
-            mirrored_x = round(bw - x - w, 4)
-            mirrored_cuts.append((mirrored_x, y, w, h))
-            
-        mirrored_cuts = sorted(mirrored_cuts, key=lambda t: (-t[1], t[0]))
-        
-        # 3. Canonical Selection: Whichever tuple evaluates as smaller becomes the universal ID.
-        # This forces a left-heavy panel and a right-heavy panel to share the exact same key.
-        cut_keys = tuple(min(cuts, mirrored_cuts))
-        
-    else:
-        # Group by opening SIZE only (center / set_x_offset alignment handles position later)
-        cut_keys = tuple(sorted(
-            [_opening_size_key(c) for c in panel.cutouts],
-            key=lambda t: (-t[1], t[0])
-        ))
-        
-    return (bw, bh, cut_keys)
-
-
-def normalize_panel_types(panels, alignment, fixed_offset_in, constraints):
-    """
-    Groups panels by identical geometries and assigns Type labels (T01, T02).
-    Now recognizes Left-Hand and Right-Hand mirrored panels as the exact same Type!
-    """
-    unique_types = {}
-    type_counter = 1
-
-    for p in panels:
-        sig_w = round(p.w * 8.0) / 8.0
-        sig_h = round(p.h * 8.0) / 8.0
-
-        std_cutouts = []
-        mir_cutouts = []
-
-        for c in getattr(p, 'cutouts', []):
-            cx = round(c['x_in'], 2)
-            cy = round(c['y_in'], 2)
-            cw = round(c['width_in'], 2)
-            ch = round(c['height_in'], 2)
-
-            std_cutouts.append((cx, cy, cw, ch))
-
-            # Simulate the panel being flipped to group LH/RH twins
-            mir_x = round(p.w - c['x_in'] - c['width_in'], 2)
-            mir_cutouts.append((mir_x, cy, cw, ch))
-
-        std_cutouts.sort()
-        mir_cutouts.sort()
-
-        std_sig = (sig_w, sig_h, tuple(std_cutouts))
-        mir_sig = (sig_w, sig_h, tuple(mir_cutouts))
-
-        # Always take the mathematically smaller signature so mirrors snap to the same ID
-        canonical_sig = min(std_sig, mir_sig)
-
-        if canonical_sig not in unique_types:
-            unique_types[canonical_sig] = "T{:02d}".format(type_counter)
-            type_counter += 1
-
-        p.name = unique_types[canonical_sig]
-
-    return panels
-
-    dim_inc = constraints.dimension_increment if constraints else 1.0
-    min_w   = constraints.min_width           if constraints else 24.0
-
-    # ── Step 1: Build groups ──────────────────────────────────────────────
-    groups = {}
-    order  = []
-    for p in panels:
-        key = _panel_type_key(p, alignment)
-        if key not in groups:
-            groups[key] = []
-            order.append(key)
-        groups[key].append(p)
-
-    # Sort by group size desc, then by first panel x
-    sorted_keys = sorted(order, key=lambda k: (-len(groups[k]), groups[k][0].x))
-
-    # ── Step 2: For center/fixed_offset, align panel positions ───────────
-    if alignment in ("center", "fixed_offset") and constraints is not None:
-        for key in sorted_keys:
-            group = groups[key]
-            if not group[0].cutouts:
-                continue  # no opening → nothing to align
-
-            panel_w = float(key[0])
-
-            for p in group:
-                # Use first cutout (primary opening) to determine shift.
-                # Capture each cutout's absolute wall position NOW, before p.x
-                # is mutated, so all arithmetic below stays correct.
-                c = p.cutouts[0]
-                open_w = float(c.get("raw_width_in", c.get("width_in", 0)))
-                cut_wall_xs = [
-                    p.x + float(cut.get("raw_x_in", cut.get("x_in", 0)))
-                    for cut in p.cutouts
-                ]
-                open_x_wall = cut_wall_xs[0]  # primary opening for shift calc
-
-                if alignment == "center":
-                    # Panel left = opening_center - panel_w/2
-                    new_panel_x = open_x_wall + open_w / 2.0 - panel_w / 2.0
-                else:  # fixed_offset
-                    # Panel left = opening_left - fixed_offset_in
-                    new_panel_x = open_x_wall - fixed_offset_in
-
-                # Snap and clamp
-                new_panel_x = round(round(new_panel_x / dim_inc) * dim_inc, 8)
-                new_panel_x = max(0.0, new_panel_x)
-
-                if new_panel_x == p.x:
-                    continue
-
-                # Guard: reject the shift if it causes an overlap with any
-                # other already-placed panel.
-                test = _copy.copy(p)
-                test.x = float(new_panel_x)
-                if any(panels_overlap(test, other) for other in panels if other is not p):
-                    print("    [ALIGN] Skipping shift for {} — new x={:.3f} would overlap "
-                          "a neighbor (was {:.3f})".format(p.name, new_panel_x, p.x))
-                    continue
-
-                p.x = float(new_panel_x)
-
-                # Recompute every cutout's x offsets relative to the new panel
-                # left, using the pre-captured absolute wall positions and the
-                # exact rough_jamb stored in each cutout dict.
-                for cut, cut_open_x_wall in zip(p.cutouts, cut_wall_xs):
-                    rough_j = float(cut.get("rough_jamb", 0.0))
-                    cut["raw_x_in"] = float(cut_open_x_wall - p.x)
-                    cut["x_in"]     = max(0.0, cut["raw_x_in"] - rough_j)
-
-    # ── Step 3: Assign type labels ────────────────────────────────────────
-    type_counter = 1
-    for key in sorted_keys:
-        group = groups[key]
-        label = "T{:02d}".format(type_counter)
-        type_counter += 1
-        for inst_idx, p in enumerate(group, start=1):
-            p.name = "{}-P{:02d}".format(label, inst_idx)
-
-    # ── Step 4: Summary log ───────────────────────────────────────────────
-    unique   = len(groups)
-    repeated = sum(1 for g in groups.values() if len(g) > 1)
-    print(Ansi.CYAN + "  [TYPES] {} unique type(s) across {} panels "
-          "({} type(s) used more than once)  alignment={}".format(
-          unique, len(panels), repeated, alignment) + Ansi.RESET)
-    for key in sorted_keys:
-        group = groups[key]
-        if len(group) > 1:
-            print("    T{:02d}: {} panels  {}\"x{}\"  {} cutout(s)".format(
-                sorted_keys.index(key) + 1,
-                len(group),
-                round(float(key[0]), 4),
-                round(float(key[1]), 4),
-                len(key[2])
-            ))
-    return panels
-
 
 # =============================================================================
 # SECTION 5: REPEATING PATTERN DETECTION & STANDARD PANEL STRATEGY
@@ -1731,52 +1668,12 @@ def process_wall(wall_id, wall_width, wall_height, openings):
     # =================================================================
     panels = []
 
-
-    # --- CLEAN BRANCHING LOGIC WITH TOURNAMENT ---
-    if getattr(strategy, 'best_to_manufacture', False):
-        print(Ansi.MAGENTA + "  [TOURNAMENT] Evaluating strategies for Wall {}...".format(wall_id) + Ansi.RESET)
-        
-        # Fetch user weight
-        u_weight = getattr(strategy, 'unique_weight', 10.0)
-        
-        # Run 1: Minimize Total Panels
-        panels_largest = place_panels_sequential(wall_width, wall_height, openings, constraints, orientation)
-        score_largest = evaluate_manufacturing_score(panels_largest, constraints, u_weight)
-        
-        # Run 2: Minimize Unique
-        panels_min = _place_minimize_unique(wall_width, wall_height, openings, constraints, orientation, strategy)
-        score_min = evaluate_manufacturing_score(panels_min, constraints, u_weight)
-        
-        # Run 3: Genetic Algorithm
-        panels_ga = _place_ga_optimized(wall_width, wall_height, openings, constraints, orientation, strategy)
-        score_ga = evaluate_manufacturing_score(panels_ga, constraints, u_weight)
-
-        
-        # Group and sort results
-        tournament = [
-            ("Minimize Total Panels", panels_largest, score_largest),
-            ("Minimize Unique", panels_min, score_min),
-            ("Genetic Algorithm", panels_ga, score_ga)
-        ]
-        
-        # Sort: Primary Score (Total + Unique), then Tie-breaker (Total Panels)
-        tournament.sort(key=lambda x: (x[2][0], x[2][1]))
-        
-        # Print the Scoreboard
-        print(Ansi.CYAN + "    --- Scoreboard ---" + Ansi.RESET)
-        for rank, (name, p_list, score) in enumerate(tournament, start=1):
-            print("    {}. {}: Score {} ({} panels, {} unique)".format(
-                rank, name.ljust(22), score[0], score[2]['panels'], score[2]['unique']
-            ))
-        
-        winner_name, winner_panels, winner_score = tournament[0]
-        print(Ansi.GREEN + "  [WINNER] {} takes the wall!".format(winner_name) + Ansi.RESET)
-        
-        # Assign winning list to our safe variable
-        panels = winner_panels
-
-    elif getattr(strategy, 'use_ga_optimizer', False):
-        print(Ansi.MAGENTA + "  [EXECUTE] Running Genetic Algorithm..." + Ansi.RESET)
+    # --- SINGLE-STRATEGY DISPATCH ---
+    # Tournament is handled building-wide in optimize_building(), which forces one
+    # base mode per pass. process_wall only ever runs ONE strategy. If a stray
+    # tournament flag reaches here, fall through to the base branches below.
+    if getattr(strategy, 'use_ga_optimizer', False):
+        print(Ansi.MAGENTA + "  [EXECUTE] Running Min Total + Unique..." + Ansi.RESET)
         panels = _place_ga_optimized(wall_width, wall_height, openings, constraints, orientation, strategy)
         
     elif getattr(strategy, 'minimize_unique_panels', False):
@@ -1790,16 +1687,8 @@ def process_wall(wall_id, wall_width, wall_height, openings):
         print(Ansi.MAGENTA + "  [EXECUTE] Running Minimize Total Panels..." + Ansi.RESET)
         panels = place_panels_sequential(wall_width, wall_height, openings, constraints, orientation)
 
-    # ── Assign type labels ────────────────────────────────────────────────
-    if getattr(strategy, 'best_to_manufacture', False) or getattr(strategy, 'minimize_unique_panels', False) or getattr(strategy, 'use_ga_optimizer', False):
-        print(Ansi.CYAN + "  [TYPES] Running panel type grouping "
-              "(alignment={})...".format(getattr(strategy, 'opening_alignment', 'center')) + Ansi.RESET)
-        panels = normalize_panel_types(
-            panels,
-            alignment=getattr(strategy, 'opening_alignment', 'center'),
-            fixed_offset_in=getattr(strategy, 'void1_x_offset_left', 6.0),
-            constraints=constraints
-        )
+    # Option 1: equalize drifted sibling panels at the source.
+    panels = _equalize_sibling_panels(panels, openings, constraints)
 
     records = []
     for panel in panels:
@@ -1885,8 +1774,8 @@ def _place_minimize_unique(wall_width, wall_height, openings, constraints,
         else:
             merged_groups.append([zs, ze, list(group)])
 
- # 3. Process each merged zone (MULTI-WINDOW ANCHORED GRID WITH LH/RH MEMORY)
-    memory_bank = {} # Stores: window_signature -> (standard_w, canonical_left)
+    # 3. Process each merged zone (MULTI-WINDOW WITH ASYMMETRICAL ANCHOR EXPANSION)
+    memory_bank = {}
 
     for zone_start, zone_end, zone_openings in merged_groups:
         primary_band = sorted(zone_openings, key=lambda o: o.x)
@@ -1898,41 +1787,80 @@ def _place_minimize_unique(wall_width, wall_height, openings, constraints,
 
         max_w_allowed = constraints.long_max if horizontal_mode else constraints.max_width
         
-        # --- NEW: LH/RH Pattern Memory Recognition ---
-        # Generate a mathematical signature for this specific cluster of windows
         band_w = primary_band[-1].x + primary_band[-1].w - primary_o.x
         local_windows = tuple((round(w.x - primary_o.x, 2), round(w.w, 2)) for w in primary_band)
-        
-        # Generate what the reverse (mirrored) version of this cluster would look like
         mirrored_windows = tuple((round(band_w - (w.x - primary_o.x) - w.w, 2), round(w.w, 2)) for w in reversed(primary_band))
 
         if mirrored_windows in memory_bank:
-            # TWIN DETECTED! Pull the exact dimensions of its mirror and flip the anchor.
             standard_w, orig_canonical_left = memory_bank[mirrored_windows]
             canonical_left = standard_w - band_w - orig_canonical_left
-            print(Ansi.CYAN + "  [PATTERN] Mirrored LH/RH Twin Detected! Applying reversed anchor." + Ansi.RESET)
+            print(Ansi.CYAN + "  [PATTERN] Mirrored LH/RH Twin Detected!" + Ansi.RESET)
             
         else:
-            # Normal Calculation (No mirror found yet)
             window_spacing = 0
             if len(primary_band) >= 2:
                 ctrs = [o.x + o.w / 2.0 for o in primary_band]
                 window_spacing = sum(ctrs[i+1] - ctrs[i] for i in range(len(ctrs)-1)) / (len(ctrs) - 1)
 
-            align_strat = getattr(strategy, 'opening_alignment', 'opening_derived')
-
-            if len(primary_band) == 1 or window_spacing < constraints.min_width:
-                standard_w = max_w_allowed
-                inc = constraints.dimension_increment
-                standard_w = math.floor(standard_w / inc) * inc
+            # --- ASYMMETRICAL MAXIMAL ANCHOR EXPANSION ---
+            # LIMIT: Only expand if the group has 2 or fewer windows (Revit Family Limit!)
+            if band_w <= max_w_allowed and len(primary_band) <= 2:
+                matching_bands = []
+                for mz_start, mz_end, mz_openings in merged_groups:
+                    mz_band = sorted(mz_openings, key=lambda o: o.x)
+                    if not mz_band: continue
+                    mz_band_w = mz_band[-1].x + mz_band[-1].w - mz_band[0].x
+                    mz_sig = tuple((round(w.x - mz_band[0].x, 2), round(w.w, 2)) for w in mz_band)
+                    mz_mir = tuple((round(mz_band_w - (w.x - mz_band[0].x) - w.w, 2), round(w.w, 2)) for w in reversed(mz_band))
+                    
+                    if mz_sig == local_windows:
+                        matching_bands.append((mz_band, True))
+                    elif mz_mir == local_windows:
+                        matching_bands.append((mz_band, False))
                 
-                if align_strat == 'center':
-                    canonical_left = (standard_w - primary_o.w) / 2.0
-                else:
-                    canonical_left = getattr(strategy, 'void1_x_offset_left', 6.0)
+                min_safe_left = max_w_allowed
+                min_safe_right = max_w_allowed
+                
+                for m_band, is_direct in matching_bands:
+                    m_first = m_band[0]
+                    m_last = m_band[-1]
+                    
+                    left_obs = 0.0
+                    right_obs = wall_width
+                    for o in openings:
+                        if o not in m_band:
+                            if o.x + o.w <= m_first.x + 0.01:
+                                left_obs = max(left_obs, o.x + o.w + constraints.panel_spacing)
+                            if o.x >= m_last.x + m_last.w - 0.01:
+                                right_obs = min(right_obs, o.x - constraints.panel_spacing)
+                                
+                    dist_left = max(0.0, m_first.x - left_obs)
+                    dist_right = max(0.0, right_obs - (m_last.x + m_last.w))
+                    
+                    if is_direct:
+                        min_safe_left = min(min_safe_left, dist_left)
+                        min_safe_right = min(min_safe_right, dist_right)
+                    else:
+                        min_safe_left = min(min_safe_left, dist_right)
+                        min_safe_right = min(min_safe_right, dist_left)
+                
+                inc = constraints.dimension_increment
+                exp_L = math.floor(min_safe_left / inc) * inc
+                exp_R = math.floor(min_safe_right / inc) * inc
+                
+                while (band_w + exp_L + exp_R) > max_w_allowed + 0.001:
+                    if exp_L > exp_R and exp_L >= inc: exp_L -= inc
+                    elif exp_R >= inc: exp_R -= inc
+                    elif exp_L >= inc: exp_L -= inc
+                    else: break
+                
+                standard_w = band_w + exp_L + exp_R
+                canonical_left = exp_L
+
+            # --- MULTI-WINDOW TILING ---
             else:
                 best_N = 1
-                for N in range(1, 50): 
+                for N in range(1, 3): # LIMIT: Force max 2 cutouts per panel!
                     w_test = (N * window_spacing) - constraints.panel_spacing
                     if w_test <= max_w_allowed:
                         best_N = N
@@ -1940,34 +1868,22 @@ def _place_minimize_unique(wall_width, wall_height, openings, constraints,
                         break 
                 
                 standard_w = (best_N * window_spacing) - constraints.panel_spacing
-                
-                if align_strat == 'center':
-                    group_w = ((best_N - 1) * window_spacing) + primary_o.w
-                    canonical_left = (standard_w - group_w) / 2.0
-                elif align_strat == 'set_x_offset':
-                    canonical_left = getattr(strategy, 'void1_x_offset_left', 6.0)
-                else:
-                    canonical_left = primary_o.clearances.panel_jamb
+                group_w = ((best_N - 1) * window_spacing) + primary_o.w
+                canonical_left = (standard_w - group_w) / 2.0
 
-            # Save this newly calculated layout to the memory bank for future mirroring!
             if standard_w is not None:
                 memory_bank[local_windows] = (standard_w, canonical_left)
 
         if standard_w is None or standard_w < constraints.min_width:
-            print(Ansi.YELLOW + '  [PATTERN] Skipping zone - math resolved below min width' + Ansi.RESET)
             continue 
 
-        # Anchor the Grid to the Window (Eliminates Snowflakes)
+        # 4. Anchor the Grid 
         actual_zone_start = primary_o.x - canonical_left
-        if actual_zone_start < 0:
-            actual_zone_start = 0.0
+        if actual_zone_start < 0: actual_zone_start = 0.0
 
         last_o = primary_band[-1]
         dist_to_cover = (last_o.x + last_o.w + canonical_left) - actual_zone_start
         n_panels = max(1, int(math.ceil((dist_to_cover - 0.1) / (standard_w + constraints.panel_spacing))))
-
-        print(Ansi.CYAN + ('  [PATTERN] Multi-Window Tiling: W={:.4g}" N={} '
-              'start={:.1f}"').format(standard_w, n_panels, actual_zone_start) + Ansi.RESET)
 
         actual_zone_end = actual_zone_start
 
@@ -1980,7 +1896,11 @@ def _place_minimize_unique(wall_width, wall_height, openings, constraints,
                     break
             
             for y_s, y_e in wall_bands:
-                p = Panel(panel_x, y_s, actual_w, y_e - y_s, 'P{:02d}'.format(panel_counter))
+                # --- FIX: VERTICAL SPACING ---
+                raw_h = y_e - y_s
+                actual_h = raw_h - constraints.panel_spacing if (raw_h - constraints.panel_spacing) >= constraints.min_height else raw_h
+                
+                p = Panel(panel_x, y_s, actual_w, actual_h, 'P{:02d}'.format(panel_counter))
                 panel_counter += 1
                 p.cutouts = calculate_panel_cutouts(p, openings)
                 panels.append(p)
@@ -2035,7 +1955,7 @@ def _place_minimize_unique(wall_width, wall_height, openings, constraints,
         u_openings = [o for o in openings if not (o.right_clearance_zone <= u_start or o.left_clearance_zone >= u_end)]
         for o in u_openings: o.x -= u_start
 
-        # Use Greedy logic to fill gaps with massive panels
+        # Use Greedy logic (with anti-splinter layout) to fill gaps with massive panels
         u_panels = place_panels_sequential(u_width, wall_height, u_openings, constraints, orientation)
         for p in u_panels:
             p.x += u_start
@@ -2045,22 +1965,92 @@ def _place_minimize_unique(wall_width, wall_height, openings, constraints,
         
         for o in u_openings: o.x += u_start
 
-    panels.sort(key=lambda p: (p.y, p.x))
-    for idx, p in enumerate(panels, start=1): p.name = "P{:02d}".format(idx)
-    return panels
+    # --- THE SEAM WELDER (Solid Panel Combiner) ---
+    welded_panels = []
+    from collections import defaultdict
+    
+    # Group panels strictly by their horizontal band (Y and Height)
+    bands = defaultdict(list)
+    for p in panels:
+        bands[(round(p.y, 3), round(p.h, 3))].append(p)
+        
+    global_max_w = constraints.long_max if horizontal_mode else constraints.max_width
+    spacing = constraints.panel_spacing
+    
+    for (y, h), band_panels in bands.items():
+        # Sort left-to-right within the specific horizontal band
+        band_panels.sort(key=lambda p: p.x)
+        
+        i = 0
+        while i < len(band_panels):
+            curr_p = band_panels[i]
+            
+            # If the panel has a cutout, it MUST remain anchored. Skip it.
+            if getattr(curr_p, 'cutouts', []):
+                welded_panels.append(curr_p)
+                i += 1
+                continue
+                
+            # If solid, look ahead to the next panels to see if we can weld them
+            j = i + 1
+            while j < len(band_panels):
+                next_p = band_panels[j]
+                
+                # Cannot weld if the next panel has a window/cutout
+                if getattr(next_p, 'cutouts', []):
+                    break
+                    
+                # Cannot weld if they are not physically adjacent
+                if abs((curr_p.x + curr_p.w + spacing) - next_p.x) > 0.1:
+                    break
+                    
+                # Cannot weld if the combined massive panel exceeds your machinery limits
+                if (curr_p.w + spacing + next_p.w) > global_max_w:
+                    break
+                    
+                # MERGE! Absorb the next panel's width and the spacing gap
+                curr_p.w += (spacing + next_p.w)
+                j += 1
+                
+            welded_panels.append(curr_p)
+            i = j
 
+    # 5. Final Sort and Naming (Welded)
+    welded_panels.sort(key=lambda p: (p.y, p.x))
+    for idx, p in enumerate(welded_panels, start=1): 
+        p.name = "P{:02d}".format(idx)
+        
+    return welded_panels
 
+        
 def process_all_walls(walls_rows, openings_rows, output_dir,
                       door_clearances, window_clearances, storefront_clearances,
-                      config=None, orientation="vertical", output_filename="optimized_panel_placement.csv"):
-    global ACTIVE_CONFIG
+                      config=None, orientation="vertical", output_filename="optimized_panel_placement.csv",
+                      force_mode=None):
+    global ACTIVE_CONFIG, LAST_RUN_STATS
     if config is not None: ACTIVE_CONFIG = config
     elif ACTIVE_CONFIG is None:
         presets = get_preset_configs()
         ACTIVE_CONFIG = presets.get(orientation, presets["vertical"])
+
+    # force_mode lets the building-wide tournament run one base strategy per pass
+    # without touching the saved flags permanently. "np"=sequential, "nu"=minimize
+    # unique, "npnu"=GA. None = use whatever flags the config already has.
+    if force_mode is not None:
+        _s = ACTIVE_CONFIG.optimization_strategy
+        _s.best_to_manufacture    = False
+        _s.minimize_unique_panels = (force_mode == "nu")
+        _s.use_ga_optimizer       = (force_mode == "npnu")
     
     all_panel_records = []
     processed_endpoints = [] # Tracks corners for butt joints
+
+    # The LIVE panel set: one library for the whole building. Every wall's
+    # panels register into it as we go, so identical panels (strict match,
+    # mirror-aware) reuse a single type instead of being relabeled only at the
+    # end. Built once here, queried/extended per wall below.
+    panel_library = PanelLibrary(
+        merge_tol=getattr(ACTIVE_CONFIG.optimization_strategy, 'merge_tolerance_in', 0.0))
     
     # Sort walls to process connected facades sequentially
     walls_rows.sort(key=lambda w: (w.get("FacadeId", ""), safe_float(w.get("wall_origin_x")), safe_float(w.get("wall_origin_y"))))
@@ -2160,9 +2150,29 @@ def process_all_walls(walls_rows, openings_rows, output_dir,
         for _pr in panel_records:
             _pr.update(_wall_geom)
             _pr["rotation_deg"] = _rot_deg
+
+        # --- LIVE PANEL SET ---
+        # Register this wall's panels into the building-wide library now, so a
+        # panel identical to one already placed on an earlier wall reuses that
+        # type (strict, mirror-aware) and inherits its exact cutout floats.
+        _types_before = panel_library.unique_count()
+        _reused_here = 0
+        for _pr in panel_records:
+            _label, _was_reused = panel_library.register(_pr)
+            if _was_reused:
+                _reused_here += 1
+        _added_here = panel_library.unique_count() - _types_before
+        print(Ansi.GREEN + "  [PANEL SET] Wall {}: {} reused / {} new type(s)"
+              .format(wall_id, _reused_here, _added_here) + Ansi.RESET)
+
         all_panel_records.extend(panel_records)
 
     if not all_panel_records: return None, None
+
+    # Panels were labeled live during the wall loop above by the shared
+    # PanelLibrary (strict matching). Print the final building-wide set.
+    panel_library.report()
+    
     panels_path = write_csv(os.path.join(output_dir, output_filename), all_panel_records, [
         "panel_name", "panel_type", "wall_id", "x_in", "y_in", "width_in", "height_in", "area_in2", 
         "rotation_deg", "x_ref", "cutouts_json", "wall_origin_x", "wall_origin_y", "wall_origin_z", 
@@ -2173,7 +2183,108 @@ def process_all_walls(walls_rows, openings_rows, output_dir,
         config_path = os.path.join(output_dir, "config_used.json")
         try: ACTIVE_CONFIG.save(config_path)
         except: pass
+
+    # Publish building-wide counts so the tournament can score np/nu honestly.
+    LAST_RUN_STATS = {"np": len(all_panel_records), "nu": panel_library.unique_count()}
     return panels_path, config_path
+
+
+def optimize_building(walls_rows, openings_rows, output_dir,
+                      door_clearances, window_clearances, storefront_clearances,
+                      config=None, orientation="vertical",
+                      output_filename="optimized_panel_placement.csv"):
+    """
+    Top-level entry point. If the strategy is Tournament, runs ALL THREE base
+    strategies across the WHOLE building, scores each by (np_weight*np +
+    nu_weight*nu) using the live PanelLibrary's true building-wide unique count,
+    and promotes the winner. Otherwise it's a single pass (identical to calling
+    process_all_walls directly). Returns (panels_path, config_path).
+    """
+    global ACTIVE_CONFIG, LAST_RUN_STATS
+    if config is not None: ACTIVE_CONFIG = config
+
+    strat = ACTIVE_CONFIG.optimization_strategy if ACTIVE_CONFIG else None
+
+    # ---- shared runner: execute candidate modes building-wide, keep the best ----
+    # Each candidate is forced via process_all_walls(force_mode=...), and its
+    # true building-wide (np, nu) come from the live PanelLibrary via LAST_RUN_STATS.
+    def _run_and_promote(candidates, pick_key, selected_flags, banner):
+        import copy as _copy, os as _os, shutil as _shutil
+        print(Ansi.MAGENTA + banner + Ansi.RESET)
+        runs = []
+        for mode, label in candidates:
+            tmp = "_cand_{0}_{1}".format(mode, output_filename)
+            p, _c = process_all_walls(
+                walls_rows, _copy.deepcopy(openings_rows), output_dir,
+                door_clearances, window_clearances, storefront_clearances,
+                config=ACTIVE_CONFIG, orientation=orientation,
+                output_filename=tmp, force_mode=mode)
+            runs.append({"mode": mode, "label": label,
+                         "nu": LAST_RUN_STATS.get("nu", 0),
+                         "np": LAST_RUN_STATS.get("np", 0),
+                         "path": p})
+            print(Ansi.CYAN + "    {0}: np={1}  nu={2}"
+                  .format(label.ljust(20), runs[-1]["np"], runs[-1]["nu"]) + Ansi.RESET)
+
+        runs.sort(key=pick_key)
+        win = runs[0]
+        print(Ansi.GREEN + "  [WINNER] {0}  (np={1}, nu={2})"
+              .format(win["label"], win["np"], win["nu"]) + Ansi.RESET)
+
+        # Promote the winner's CSV to the real output filename.
+        final_path = _os.path.join(output_dir, output_filename)
+        try:
+            if win["path"] and _os.path.exists(win["path"]):
+                _shutil.copyfile(win["path"], final_path)
+        except Exception:
+            final_path = win["path"]
+
+        # config_used.json reflects the user's SELECTED strategy, not the
+        # internally-forced winner mode (which is an implementation detail).
+        s = ACTIVE_CONFIG.optimization_strategy
+        s.best_to_manufacture    = selected_flags.get("best_to_manufacture", False)
+        s.minimize_unique_panels = selected_flags.get("minimize_unique_panels", False)
+        s.use_ga_optimizer       = selected_flags.get("use_ga_optimizer", False)
+        config_path = _os.path.join(output_dir, "config_used.json")
+        try: ACTIVE_CONFIG.save(config_path)
+        except Exception: pass
+
+        for r in runs:
+            try:
+                if r["path"] and r["path"] != final_path and _os.path.exists(r["path"]):
+                    _os.remove(r["path"])
+            except Exception:
+                pass
+        return final_path, config_path
+
+    # ---- Tournament: all three, weighted, building-wide ----
+    if strat and getattr(strat, 'best_to_manufacture', False):
+        np_w = getattr(strat, 'np_weight', 1.0)
+        nu_w = getattr(strat, 'nu_weight', getattr(strat, 'unique_weight', 10.0))
+        return _run_and_promote(
+            [("np", "Minimize Total"), ("nu", "Minimize Unique"), ("npnu", "Min Total + Unique")],
+            pick_key=lambda r: (np_w * r["np"] + nu_w * r["nu"], r["nu"], r["np"]),
+            selected_flags={"best_to_manufacture": True},
+            banner="  [TOURNAMENT] Running all 3 strategies building-wide "
+                   "(np_w={0:g}, nu_w={1:g})...".format(np_w, nu_w))
+
+    # ---- Minimize Unique: HARD GUARANTEE it never regresses vs Min-Total ----
+    # Run both building-wide and keep whichever has fewer UNIQUE types; on a tie,
+    # fewer total panels wins (that is Min-Total). So Min-Unique can only ever
+    # match or beat Min-Total on unique count -- never lose to it.
+    if strat and getattr(strat, 'minimize_unique_panels', False):
+        return _run_and_promote(
+            [("nu", "Minimize Unique"), ("np", "Minimize Total")],
+            pick_key=lambda r: (r["nu"], r["np"]),
+            selected_flags={"minimize_unique_panels": True},
+            banner="  [MIN-UNIQUE] Comparing vs Min-Total building-wide "
+                   "(unique must not regress)...")
+
+    # ---- Everything else (Min-Total, GA): single straight pass ----
+    return process_all_walls(walls_rows, openings_rows, output_dir,
+        door_clearances, window_clearances, storefront_clearances,
+        config=ACTIVE_CONFIG, orientation=orientation,
+        output_filename=output_filename)
 
 def write_csv(path, rows, fieldnames=None):
     if not rows: return None
@@ -2269,7 +2380,210 @@ def determine_panel_width_with_opening(x_cursor, x_end, y_start, y_end, max_widt
     panel_w = snap_down(panel_w, DIMENSION_INCREMENT)
     return (panel_w, False, next_opening)
 
+class PanelLibrary(object):
+    """
+    The LIVE, building-wide set of panel types. Every strategy registers its
+    panels here as walls are processed, and every panel inherits its type label
+    (and its master's exact cutout floats) from this single source of truth.
 
+    Reuse is STRICT. A panel only collapses onto an existing type when its
+    canonical signature matches within ``match_tol`` -- a pure float-noise floor
+    (1/16" by default), NOT a merge tolerance. Widths are never distorted to
+    force a match. Panels that differ by more than the noise floor stay distinct,
+    even if they are physically close: those are surfaced as near-duplicate
+    warnings so they can be reconciled upstream rather than silently merged
+    (which is what the old 1" normalize did -- and that relocated cutouts).
+
+    Mirror-aware: a left-hand panel and its right-hand twin share one type.
+    """
+
+    def __init__(self, match_tol=0.0625, near_tol=0.5, merge_tol=0.0):
+        self.match_tol = float(match_tol)   # exact-match noise floor (<< 0.5")
+        self.near_tol  = float(near_tol)    # report (don't merge) within this
+        self.merge_tol = float(merge_tol)   # Option 2: ACTUALLY merge within this
+        self.types = {}                     # canonical_sig -> master dict
+        self._order = []                    # canonical_sigs in discovery order
+        self._counter = 0
+        self._merged = 0                    # how many panels were drift-merged
+
+    # -- internal: quantize a value onto the strict match grid ----------------
+    def _q(self, v):
+        t = self.match_tol
+        return round(float(v) / t) * t
+
+    # -- build the mirror-aware canonical signature for a panel ---------------
+    def _signature(self, w, h, cutouts):
+        sig_w = self._q(w)
+        sig_h = self._q(h)
+        std, mir = [], []
+        for c in cutouts:
+            cy = self._q(c['y_in'])
+            cw = self._q(c['width_in'])
+            ch = self._q(c['height_in'])
+            std.append((self._q(c['x_in']), cy, cw, ch))
+            mir.append((self._q(w - c['x_in'] - c['width_in']), cy, cw, ch))
+        std.sort()
+        mir.sort()
+        std_sig = (sig_w, sig_h, tuple(std))
+        mir_sig = (sig_w, sig_h, tuple(mir))
+        canonical = min(std_sig, mir_sig)
+        return canonical, (canonical == mir_sig)
+
+    # -- read-only query: does an identical type already exist? ---------------
+    # (Hook for future placement-time reuse. Returns the type label or None.
+    #  Does NOT mutate the library.)
+    def find_reusable(self, w, h, cutouts):
+        canon, _ = self._signature(w, h, cutouts)
+        t = self.types.get(canon)
+        return t["label"] if t else None
+
+    # -- register a panel record, assigning its type label in place -----------
+    def register(self, record):
+        import copy, json
+        cutouts = json.loads(record["cutouts_json"]) if record["cutouts_json"] else []
+        w = float(record["width_in"])
+        h = float(record["height_in"])
+        canon, is_mir = self._signature(w, h, cutouts)
+
+        # 1) EXACT strict twin -> inherit master floats, keep own (identical) dims.
+        if canon in self.types:
+            return self._absorb(record, self.types[canon], w, is_mir, snap_dims=False)
+
+        # 2) NEAR twin within merge_tol (Option 2). Collapses measurement/algorithm
+        #    drift (e.g. 305.000 vs 305.625) into one real fabrication type. The
+        #    child adopts the master's exact dims, so the only cost is a placement
+        #    delta of at most merge_tol.
+        if self.merge_tol > 0.0:
+            near = self._find_near(w, h, cutouts)
+            if near is not None:
+                self._merged += 1
+                return self._absorb(record, near, w, is_mir, snap_dims=True)
+
+        # 3) Brand-new type.
+        self._counter += 1
+        label = "T{:02d}".format(self._counter)
+        self.types[canon] = {
+            "label": label, "is_mirrored": is_mir,
+            "cutouts": copy.deepcopy(cutouts), "w": w, "h": h,
+            "count": 1, "reused": False,
+        }
+        self._order.append(canon)
+        record["panel_name"] = "{}-P{:02d}".format(label, 1)
+        return label, False
+
+    def _absorb(self, record, t, w, is_mir, snap_dims):
+        """Attach `record` to existing type `t`, inheriting master cutout floats.
+        If snap_dims, also adopt the master's width/height (near-merge case)."""
+        import copy, json
+        t["count"] += 1
+        t["reused"] = True
+        ref_w = t["w"] if snap_dims else w
+        new_cutouts = []
+        for mc in t["cutouts"]:
+            nc = copy.deepcopy(mc)
+            if is_mir != t["is_mirrored"]:
+                nc["x_in"]     = ref_w - mc["x_in"]     - mc["width_in"]
+                nc["raw_x_in"] = ref_w - mc["raw_x_in"] - mc["raw_width_in"]
+            new_cutouts.append(nc)
+        record["cutouts_json"] = json.dumps(new_cutouts) if new_cutouts else ""
+        if snap_dims:
+            record["width_in"]  = t["w"]
+            record["height_in"] = t["h"]
+            record["area_in2"]  = t["w"] * t["h"]
+        record["panel_name"] = "{}-P{:02d}".format(t["label"], t["count"])
+        return t["label"], True
+
+    def _find_near(self, w, h, cutouts):
+        """Linear scan for a master whose dims AND cutouts all sit within merge_tol
+        (mirror-aware). Returns the master dict or None. Greedy: first discovered
+        compatible type wins."""
+        tol = self.merge_tol
+        for canon in self._order:
+            t = self.types[canon]
+            if abs(w - t["w"]) > tol or abs(h - t["h"]) > tol:
+                continue
+            if len(cutouts) != len(t["cutouts"]):
+                continue
+            if self._cutouts_close(w, cutouts, t, tol):
+                return t
+        return None
+
+    def _cutouts_close(self, w, cutouts, t, tol):
+        master = sorted((m["x_in"], m["y_in"], m["width_in"], m["height_in"])
+                        for m in t["cutouts"])
+        direct = sorted((c["x_in"], c["y_in"], c["width_in"], c["height_in"])
+                        for c in cutouts)
+        if all(abs(a[i] - b[i]) <= tol for a, b in zip(direct, master) for i in range(4)):
+            return True
+        mir = sorted((w - c["x_in"] - c["width_in"], c["y_in"], c["width_in"], c["height_in"])
+                     for c in cutouts)
+        if all(abs(a[i] - b[i]) <= tol for a, b in zip(mir, master) for i in range(4)):
+            return True
+        return False
+
+    # -- count of distinct types currently in the set -------------------------
+    def unique_count(self):
+        return len(self.types)
+
+    # -- ordered (label, count, w, h) rows for reporting ----------------------
+    def rows(self):
+        out = []
+        for canon in self._order:
+            t = self.types[canon]
+            out.append((t["label"], t["count"], t["w"], t["h"]))
+        return out
+
+    # -- find type pairs that are physically close but kept separate ----------
+    def near_duplicates(self):
+        rows = [(self.types[c]["label"], self.types[c]["w"], self.types[c]["h"],
+                 self.types[c]["count"]) for c in self._order]
+        pairs = []
+        for i in range(len(rows)):
+            for j in range(i + 1, len(rows)):
+                la, wa, ha, ca = rows[i]
+                lb, wb, hb, cb = rows[j]
+                dw = abs(wa - wb)
+                dh = abs(ha - hb)
+                if dw <= self.near_tol and dh <= self.near_tol and (dw + dh) > 0:
+                    pairs.append((la, wa, ha, ca, lb, wb, hb, cb, dw, dh))
+        return pairs
+
+    # -- print the live set + any near-duplicate warnings ---------------------
+    def report(self):
+        rows = self.rows()
+        total_panels = sum(r[1] for r in rows)
+        merged_note = (" ({} drift-merged @ {:g}\")".format(self._merged, self.merge_tol)
+                       if self.merge_tol > 0 and self._merged else "")
+        print(Ansi.CYAN + "  [PANEL SET] {} unique types across {} panels{}"
+              .format(len(rows), total_panels, merged_note) + Ansi.RESET)
+        for label, count, w, h in rows:
+            print("    {}  {:>7.3f} x {:<7.3f}  -> {} panel(s)"
+                  .format(label.ljust(5), w, h, count))
+        nd = self.near_duplicates()
+        if nd:
+            print(Ansi.YELLOW + "  [NEAR-DUPLICATES] kept SEPARATE under strict "
+                  "matching (reconcile upstream if intentional):" + Ansi.RESET)
+            for la, wa, ha, ca, lb, wb, hb, cb, dw, dh in nd:
+                print(Ansi.YELLOW + "    {} ({:.3f}x{:.3f}) vs {} ({:.3f}x{:.3f})"
+                      "  -- dW={:.3f}\" dH={:.3f}\"".format(
+                          la, wa, ha, lb, wb, hb, dw, dh) + Ansi.RESET)
+
+
+def global_normalize_records(records, tol=0.0625):
+    """
+    Backward-compatible single-shot labeler. Now delegates to PanelLibrary so the
+    type/mirror/inherit logic lives in exactly one place. ``tol`` is the strict
+    float-noise floor (defaults to 1/16"), NOT a merge tolerance: panels that
+    differ by more than ``tol`` are kept as distinct types. Prefer building one
+    live PanelLibrary across the run; this wrapper exists for old call sites.
+    """
+    print(Ansi.CYAN + "  [TYPES] Labeling panels via live PanelLibrary "
+          "(strict matching, tol={0:g}\")...".format(tol) + Ansi.RESET)
+    lib = PanelLibrary(match_tol=tol)
+    for r in records:
+        lib.register(r)
+    lib.report()
+    return records
 
 # =============================================================================
 # SECTION 6: VISUALIZATION (optional)

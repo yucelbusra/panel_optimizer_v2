@@ -14,13 +14,18 @@ from datetime import datetime
 import clr
 clr.AddReference('System.Windows.Forms')
 clr.AddReference('System.Drawing')
+
+
+
 from System.Windows.Forms import (
     Application, FolderBrowserDialog, DialogResult, Form,
     Label, RadioButton, Button, FormBorderStyle, FormStartPosition,
     MessageBox, MessageBoxButtons, MessageBoxIcon, TextBox,
     Panel, ScrollableControl, AnchorStyles, DockStyle, Padding,
-    FlatStyle, CheckBox
+    FlatStyle, CheckBox, TabControl, TabPage
 )
+
+
 from System.Drawing import (
     Point, Size, Color, Font, FontStyle, ContentAlignment, GraphicsUnit,
     SolidBrush, Pen, StringFormat, StringAlignment, RectangleF, PointF
@@ -182,61 +187,51 @@ class ConfigDialog(Form):
         """Compute all pixel constants relative to the current DPI scale."""
         s = _DPI_SCALE
         self._LEFT   = _scale(4,   s)
-        self._LBL_W  = _scale(210, s)
-        self._TXT_X  = _scale(222, s)
+        self._LBL_W  = _scale(265, s) # WIDENED for long labels
+        self._TXT_X  = _scale(275, s) # SHIFTED right
         self._TXT_W  = _scale(115, s)
-        self._CLR1_X = _scale(222, s)
-        self._CLR2_X = _scale(352, s)
-        self._TOT_X  = _scale(482, s)
+        self._CLR1_X = _scale(275, s) # SHIFTED right
+        self._CLR2_X = _scale(420, s) # WIDENED gap to 145px
+        self._TOT_X  = _scale(570, s) # WIDENED gap to 150px
         self._TOT_W  = _scale(75,  s)
         self._ROW_H  = _scale(34,  s)
 
+
     def _build(self):
         s = _DPI_SCALE
-        self.Text            = "Panel Optimizer - Configuration"
+        self.Text            = "RNGD Panel Optimizer - Configuration"
         self.StartPosition   = FormStartPosition.CenterScreen
-        self.FormBorderStyle = FormBorderStyle.Sizable
-        self.AutoScroll      = True
+        self.FormBorderStyle = FormBorderStyle.FixedDialog
+        self.MaximizeBox     = False
         
-        # Resized window since we removed the diagram
-        self.MinimumSize = Size(_scale(850, s), _scale(600, s))
-        sw, sh = _get_screen_size()
-        form_w = min(_scale(950, s), int(sw * 0.82))
-        form_h = min(_scale(820, s), int(sh * 0.82))
-        self.ClientSize      = Size(form_w, form_h)
+        self.ClientSize      = Size(_scale(780, s), _scale(720, s))
         self.TopMost         = True
         self.BackColor       = CLR_BODY_BG
         self.Font            = FNT_NORMAL
 
         # --- Title strip ---
-        title_h = _scale(38, s)
         tp = Panel()
         tp.Dock      = DockStyle.Top
-        tp.Height    = title_h
+        tp.Height    = _scale(45, s)
         tp.BackColor = CLR_TITLE_BG
         tl = Label()
-        tl.Text      = "Panel Optimizer - Configuration"
+        tl.Text      = "RNGD Panel Optimizer"
         tl.Font      = FNT_TITLE
         tl.ForeColor = Color.White
         tl.AutoSize  = True
-        tl.Location  = Point(_scale(12, s), _scale(10, s))
+        tl.Location  = Point(_scale(15, s), _scale(12, s))
         tp.Controls.Add(tl)
         self.Controls.Add(tp)
 
         # --- Button bar ---
-        btn_bar_h  = _scale(48, s)
-        btn_w_ok   = _scale(120, s)
-        btn_w_can  = _scale(90,  s)
-        btn_h      = _scale(30,  s)
         bb = Panel()
         bb.Dock      = DockStyle.Bottom
-        bb.Height    = btn_bar_h
-        bb.BackColor = Color.FromArgb(220, 220, 220)
+        bb.Height    = _scale(55, s)
+        bb.BackColor = Color.FromArgb(230, 230, 230)
 
         self._btnOK = Button()
         self._btnOK.Text      = "Run Optimizer"
-        self._btnOK.Size      = Size(btn_w_ok, btn_h)
-        self._btnOK.Anchor    = AnchorStyles.Top | AnchorStyles.Right
+        self._btnOK.Size      = Size(_scale(140, s), _scale(32, s))
         self._btnOK.BackColor = CLR_ACCENT
         self._btnOK.ForeColor = Color.White
         self._btnOK.FlatStyle = FlatStyle.Flat
@@ -246,27 +241,187 @@ class ConfigDialog(Form):
 
         self._btnCancel = Button()
         self._btnCancel.Text         = "Cancel"
-        self._btnCancel.Size         = Size(btn_w_can, btn_h)
-        self._btnCancel.Anchor       = AnchorStyles.Top | AnchorStyles.Right
+        self._btnCancel.Size         = Size(_scale(100, s), _scale(32, s))
         self._btnCancel.DialogResult = DialogResult.Cancel
         self._btnCancel.FlatStyle    = FlatStyle.Flat
         self.CancelButton            = self._btnCancel
+        
+        # Position buttons
+        w = self.ClientSize.Width
+        self._btnOK.Location = Point(w - _scale(260, s), _scale(11, s))
+        self._btnCancel.Location = Point(w - _scale(110, s), _scale(11, s))
 
         bb.Controls.Add(self._btnOK)
         bb.Controls.Add(self._btnCancel)
         self.Controls.Add(bb)
 
-        bb.SizeChanged += self._reposition_buttons
-        self._bb = bb
+        # --- Tab Control ---
+        self._tabs = TabControl()
+        self._tabs.Dock = DockStyle.Fill
+        self._tabs.Padding = Point(_scale(15, s), _scale(6, s))
+        self._tabs.Font = FNT_BOLD
+        self.Controls.Add(self._tabs)
+        self._tabs.BringToFront()
 
-        # --- Scrollable body ---
+        self._populate_tabs()
+
+    def _populate_tabs(self):
+        s = _DPI_SCALE
+        
+        # TAB 1: Project & Strategy
+        tab_strat = TabPage("1. Strategy & Goals")
+        tab_strat.BackColor = CLR_BODY_BG
+        tab_strat.Font = FNT_NORMAL
         self._scroll = ScrollableControl()
-        self._scroll.Dock       = DockStyle.Fill
+        self._scroll.Dock = DockStyle.Fill
         self._scroll.AutoScroll = True
-        self._scroll.BackColor  = CLR_BODY_BG
-        self.Controls.Add(self._scroll)
+        tab_strat.Controls.Add(self._scroll)
+        self._tabs.TabPages.Add(tab_strat)
+        
+        y = 10
+        y = self._section(y, "Project Identity")
+        y = self._text_row(y, "Project Name", self._cfg.project_name, "_prj")
+        
+        y = self._section(y, "Primary Optimization Goal")
+        os_ = self._cfg.optimization_strategy
+        
+        if getattr(os_, 'best_to_manufacture', False): cur_goal = "Tournament (Best of All)"
+        elif getattr(os_, 'use_ga_optimizer', False): cur_goal = "Minimize Total + Unique Panels"
+        elif getattr(os_, 'minimize_unique_panels', False): cur_goal = "Minimize Unique Panels"
+        else: cur_goal = "Minimize Total Panels"
 
-        self._populate_rows()
+        y = self._radio_row(y, "Select Strategy",
+                            ["Minimize Total Panels", "Minimize Unique Panels", 
+                             "Minimize Total + Unique Panels", "Tournament (Best of All)"],
+                            cur_goal, "_rb_goal")
+
+        y = self._num_row(y, "DfMA Penalty (1 Unique Type = X Panels)", getattr(os_, "unique_weight", 10.0), "_txt_weight")
+        
+        # Strategy Descriptions - WRAPPED IN A ROW PANEL TO PREVENT OVERLAP
+        desc_text = (
+            "• Minimize Total Panels: Uses largest panels possible. Fewest crane picks. Highest unique count.\n"
+            "• Minimize Unique Panels: Standardizes patterns. High symmetry. Forces identical bounding boxes.\n"
+            "• Minimize Total + Unique: Uses evolutionary math to find the perfect numerical balance.\n"
+            "• Tournament: Runs all three engines and automatically selects the lowest DfMA score."
+        )
+        desc_h = _scale(75, s)
+        desc_row = self._make_row(y, CLR_BODY_BG, desc_h)
+        
+        desc_lbl = Label()
+        desc_lbl.Text = desc_text
+        desc_lbl.Font = FNT_SMALL
+        desc_lbl.ForeColor = Color.FromArgb(80, 80, 80)
+        desc_lbl.Location = Point(self._LEFT + _scale(16, s), 0)
+        desc_lbl.Size = Size(_scale(720, s), desc_h)
+        
+        desc_row.Controls.Add(desc_lbl)
+        self._scroll.Controls.Add(desc_row)
+        y += desc_h + 1
+
+        y = self._section(y, "Sub-Strategies (Applies to 'Minimize Unique' only)")
+        
+        _cur_align = getattr(os_, "opening_alignment", "opening_derived")
+        _align_rev = {
+            "opening_derived": "Opening-Derived Width",
+            "center":          "Center Openings",
+            "set_x_offset":    "Set X Offset",
+        }
+        _cur_align_lbl = _align_rev.get(_cur_align, "Opening-Derived Width")
+        
+        y = self._radio_row(y, "Window Alignment", ["Opening-Derived Width", "Center Openings", "Set X Offset"], 
+                            _cur_align_lbl, "_rb_align")
+                            
+        y = self._num_row(y, "Void 1 X Offset Left (if 'Set X Offset')", getattr(os_, "void1_x_offset_left", 6.0), "_void1_x_offset_left")
+        
+        _cur_nw = getattr(os_, "nonwindow_strategy", "largest")
+        _nw_rev = {"largest": "Minimize Total Panels", "standardise": "Identical (match standard W)"}
+        _cur_nw_lbl = _nw_rev.get(_cur_nw, "Minimize Total Panels")
+        
+        y = self._radio_row(y, "No-Opening Blank Walls", ["Minimize Total Panels", "Identical (match standard W)"], 
+                            _cur_nw_lbl, "_rb_nw")
+        
+        
+        # TAB 2: Physical Constraints
+        tab_dims = TabPage("2. Panel Constraints")
+        tab_dims.BackColor = CLR_BODY_BG
+        tab_dims.Font = FNT_NORMAL
+        scroll_dims = ScrollableControl()
+        scroll_dims.Dock = DockStyle.Fill
+        scroll_dims.AutoScroll = True
+        tab_dims.Controls.Add(scroll_dims)
+        self._tabs.TabPages.Add(tab_dims)
+        
+        # Temporarily re-route self._scroll so row builders place items in Tab 2
+        self._scroll = scroll_dims
+        y = 10
+        y = self._section(y, "Orientation & Spacing")
+        cur_orient = self._cfg.optimization_strategy.panel_orientation.capitalize()
+        y = self._radio_row(y, "Orientation", ["Vertical", "Horizontal"], cur_orient, "_rb_orient")
+        sp = self._cfg.panel_constraints.panel_spacing
+        y = self._radio_row(y, "Panel Type / Gap", ["Backer (1/8\")", "Fully Finished (3/4\")"], 
+                            "Fully Finished (3/4\")" if abs(sp - 0.75) < 0.01 else "Backer (1/8\")", "_rb_type")
+
+        _cur_swap = getattr(self._cfg.optimization_strategy, "horizontal_to_vertical_threshold_in", 143.0)
+        y = self._num_row(y, "Auto-Vertical Threshold for Horizontal Mode (in)", _cur_swap, "_txt_swap_thresh")
+        
+        y = self._section(y, "Manufacturing Dimensions")
+        pc = self._cfg.panel_constraints
+        for lbl, val, attr in [
+            ("Min Width (in)", pc.min_width, "_dim_min_w"), ("Max Width (in)", pc.max_width, "_dim_max_w"),
+            ("Min Height (in)", pc.min_height, "_dim_min_h"), ("Max Height (in)", pc.max_height, "_dim_max_h"),
+            ("Short Max (in)", pc.short_max, "_dim_short"), ("Long Max (in)", pc.long_max, "_dim_long"),
+            ("Dimension Increment (in)", pc.dimension_increment, "_dim_inc"),
+        ]:
+            y = self._num_row(y, lbl, val, attr)
+
+
+        # TAB 3: Clearances
+        tab_clr = TabPage("3. Clearances")
+        tab_clr.BackColor = CLR_BODY_BG
+        tab_clr.Font = FNT_NORMAL
+        scroll_clr = ScrollableControl()
+        scroll_clr.Dock = DockStyle.Fill
+        scroll_clr.AutoScroll = True
+        tab_clr.Controls.Add(scroll_clr)
+        self._tabs.TabPages.Add(tab_clr)
+        
+        self._scroll = scroll_clr
+        y = 10
+        y = self._section(y, "Door Clearances")
+        y = self._clr_header(y)
+        dc = self._cfg.door_clearances
+        for side, rv, pv, ra, pa in [("Jamb", dc.rough_jamb, dc.panel_jamb, "_dc_rj", "_dc_pj"), 
+                                     ("Header", dc.rough_header, dc.panel_header, "_dc_rh", "_dc_ph"), 
+                                     ("Sill", dc.rough_sill, dc.panel_sill, "_dc_rs", "_dc_ps")]:
+            y = self._clr_row(y, side, rv, pv, ra, pa)
+
+        y = self._section(y, "Window Clearances")
+        y = self._clr_header(y)
+        wc = self._cfg.window_clearances
+        for side, rv, pv, ra, pa in [("Jamb", wc.rough_jamb, wc.panel_jamb, "_wc_rj", "_wc_pj"), 
+                                     ("Header", wc.rough_header, wc.panel_header, "_wc_rh", "_wc_ph"), 
+                                     ("Sill", wc.rough_sill, wc.panel_sill, "_wc_rs", "_wc_ps")]:
+            y = self._clr_row(y, side, rv, pv, ra, pa)
+            
+        y = self._section(y, "Storefront Clearances")
+        y = self._clr_header(y)
+        sc = self._cfg.storefront_clearances
+        for side, rv, pv, ra, pa in [("Jamb", sc.rough_jamb, sc.panel_jamb, "_sc_rj", "_sc_pj"), 
+                                     ("Header", sc.rough_header, sc.panel_header, "_sc_rh", "_sc_ph"), 
+                                     ("Sill", sc.rough_sill, sc.panel_sill, "_sc_rs", "_sc_ps")]:
+            y = self._clr_row(y, side, rv, pv, ra, pa)
+            
+        y = self._section(y, "Wall Opening Clearances")
+        y = self._clr_header(y)
+        woc = self._cfg.wall_opening_clearances
+        for side, rv, pv, ra, pa in [
+            ("Jamb",   woc.rough_jamb,   woc.panel_jamb,   "_woc_rj", "_woc_pj"),
+            ("Header", woc.rough_header, woc.panel_header, "_woc_rh", "_woc_ph"),
+            ("Sill",   woc.rough_sill,   woc.panel_sill,   "_woc_rs", "_woc_ps"),
+        ]:
+            y = self._clr_row(y, side, rv, pv, ra, pa)
+
+
 
     def _reposition_buttons(self, s, e):
         w = self._bb.ClientSize.Width
@@ -507,10 +662,15 @@ class ConfigDialog(Form):
 
     def _clr_header(self, y):
         row = self._make_row(y, CLR_SUB_BG)
+        
+        # Dynamically calculate column widths so text is never cut off
+        w_clr1 = self._CLR2_X - self._CLR1_X
+        w_clr2 = self._TOT_X - self._CLR2_X
+        
         for txt, x, w in [
             ("Side",                 _scale(6, _DPI_SCALE),  self._LBL_W - _scale(14, _DPI_SCALE)),
-            ("Rough Opening (in)",   self._CLR1_X,           _scale(140, _DPI_SCALE)),
-            ("Panel Clearance (in)", self._CLR2_X,           _scale(140, _DPI_SCALE)),
+            ("Rough Opening (in)",   self._CLR1_X,           w_clr1),
+            ("Panel Clearance (in)", self._CLR2_X,           w_clr2),
             ("Total (in)",           self._TOT_X,            self._TOT_W),
         ]:
             l = Label()
@@ -634,22 +794,38 @@ class ConfigDialog(Form):
 
         radios = []
         rx = self._TXT_X
-        # Scaled spacing to fit all 4 options nicely across the wider window
-        radio_step = _scale(165, _DPI_SCALE) 
+        ry = _scale(4, _DPI_SCALE)
+        max_row_h = self._ROW_H
+        
+        # Max width before wrapping to the next line
+        wrap_limit = _scale(780, _DPI_SCALE) 
+        
         for opt_text in options:
             rb = RadioButton()
             rb.Text     = opt_text
             rb.Checked  = (opt_text == selected)
             rb.AutoSize = True
             rb.Font     = FNT_NORMAL
-            rb.Location = Point(rx, _scale(4, _DPI_SCALE))
+            
+            # Safe pixel width estimation
+            est_w = _scale(len(opt_text) * 7.5 + 35, _DPI_SCALE)
+            
+            # Wrap to next line if needed
+            if rx + est_w > wrap_limit:
+                rx = self._TXT_X
+                ry += _scale(24, _DPI_SCALE)
+                max_row_h += _scale(24, _DPI_SCALE)
+                lbl.Size = Size(self._LBL_W, max_row_h)
+
+            rb.Location = Point(rx, ry)
             row.Controls.Add(rb)
             radios.append(rb)
-            rx += radio_step
+            rx += est_w + _scale(10, _DPI_SCALE)
 
         setattr(self, attr, radios)
+        row.Height = max_row_h
         self._scroll.Controls.Add(row)
-        return y + self._ROW_H + 1
+        return y + max_row_h + 1
 
     # ---------------------------------------------------------------- helpers
 
@@ -756,12 +932,16 @@ class ConfigDialog(Form):
         os_ = self._cfg.optimization_strategy
         selected_goal = self._selected("_rb_goal")
         
-        # Exact string match prevents "Minimize" from triggering both flags
-        os_.best_to_manufacture    = (selected_goal == "Best to Manufacture")
-        os_.use_ga_optimizer       = (selected_goal == "Genetic Algorithm")
-        os_.minimize_unique_panels = (selected_goal == "Minimize Unique")
+        os_.best_to_manufacture    = ("Tournament" in selected_goal)
+        os_.use_ga_optimizer       = ("Total + Unique" in selected_goal)
+        os_.minimize_unique_panels = (selected_goal == "Minimize Unique Panels")
 
         os_.unique_weight = self._flt("_txt_weight", 10.0)
+        # The single "1 Unique Type = X Panels" field IS the unique weight.
+        # The calculator's GA/tournament read np_weight & nu_weight directly,
+        # so mirror the field into nu_weight and keep np_weight as the baseline.
+        os_.nu_weight = os_.unique_weight
+        os_.np_weight = 1.0
 
         # Opening alignment strategy
         _align_map = {
@@ -779,6 +959,8 @@ class ConfigDialog(Form):
             "Identical (match standard W)": "standardise",
         }
         os_.nonwindow_strategy = _nw_map.get(self._selected("_rb_nw"), "largest")
+
+        os_.horizontal_to_vertical_threshold_in = self._flt("_txt_swap_thresh", 143.0)
 
         self.DialogResult = DialogResult.OK
         self.Close()
@@ -868,7 +1050,7 @@ def main():
     walls_rows    = opt.load_walls_from_csv(walls_csv)
     openings_rows = opt.load_openings_from_csv(openings_csv)
 
-    panels_path, config_path = opt.process_all_walls(
+    panels_path, config_path = opt.optimize_building(
         walls_rows, openings_rows, output_dir,
         config.door_clearances,
         config.window_clearances,
