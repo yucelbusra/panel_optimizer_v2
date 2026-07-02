@@ -21,7 +21,8 @@ from Autodesk.Revit.DB import (
     FilteredElementCollector, Wall, Transaction, XYZ, Line,
     FamilySymbol, BuiltInCategory, BuiltInParameter, Transform, ElementId,
     DirectShape, ElementTransformUtils, FamilyPlacementType,
-    HostObjectUtils, ShellLayerType, PlanarFace
+    HostObjectUtils, ShellLayerType, PlanarFace,
+    Color, OverrideGraphicSettings, FillPatternElement # <-- Added for Visualization
 )
 
 try:
@@ -162,6 +163,24 @@ def _try_float_strict(val):
     if s == "": return None, False
     try: return float(s), True
     except: return None, False
+
+# --- NEW VISUALIZATION HELPER ---
+def get_color_from_string(text):
+    """Generates a consistent RGB Color based on a string (like 'T01')."""
+    # Simple hash to generate consistent numbers from text
+    hash_val = hash(text)
+    
+    # Extract R, G, B values (keep them bright/pastel by avoiding low numbers)
+    r = (hash_val & 0xFF0000) >> 16
+    g = (hash_val & 0x00FF00) >> 8
+    b = hash_val & 0x0000FF
+    
+    # Ensure colors aren't too dark
+    r = max(100, r)
+    g = max(100, g)
+    b = max(100, b)
+    
+    return Color(r, g, b)
 
 
 # ========== GEOMETRY CORE ==========
@@ -877,8 +896,23 @@ def main():
     panels_map = {}
     for p in panels:
         panels_map.setdefault(p["wall_id"], []).append(p)
+        
+    # --- VISUALIZATION SETUP ---
+    active_view = doc.ActiveView
+    
+    # 1. Prepare Wall Transparency Override
+    wall_override = OverrideGraphicSettings()
+    wall_override.SetSurfaceTransparency(80)
+    
+    # 2. Get the Solid Fill pattern ID for the panels
+    solid_fill_collector = FilteredElementCollector(doc).OfClass(FillPatternElement)
+    solid_fill_id = None
+    for fp in solid_fill_collector:
+        if fp.GetFillPattern().IsSolidFill:
+            solid_fill_id = fp.Id
+            break
 
-    t = Transaction(doc, "Place Panels with Void Control")
+    t = Transaction(doc, "Place Panels with Void Control and Colorization")
     t.Start()
 
     if sym and not use_ds:
@@ -898,12 +932,38 @@ def main():
                 continue
 
             print("\n--- Wall {0} ---".format(wid))
+            
+            # --- APPLY WALL TRANSPARENCY ---
+            try:
+                active_view.SetElementOverrides(wall.Id, wall_override)
+            except Exception as e:
+                print("  [WARN] Failed to set transparency for Wall {0}: {1}".format(wid, e))
+                
             for p in wall_panels:
                 if use_ds:
                     res = create_panel_as_direct_shape(wall, p)
                 else:
                     res = place_panel_family(wall, p, sym)
-                if res: count += 1
+                    
+                if res: 
+                    count += 1
+                    
+                    # --- APPLY PANEL COLOR OVERRIDE ---
+                    if solid_fill_id:
+                        try:
+                            # Extract the base type name from the panel_name (e.g. "T01-P01" -> "T01")
+                            p_name = p.get("panel_name", "Default")
+                            type_name = p_name.split('-')[0] if '-' in p_name else p_name
+                            
+                            panel_color = get_color_from_string(type_name)
+                            
+                            panel_override = OverrideGraphicSettings()
+                            panel_override.SetSurfaceForegroundPatternId(solid_fill_id)
+                            panel_override.SetSurfaceForegroundPatternColor(panel_color)
+                            
+                            active_view.SetElementOverrides(res.Id, panel_override)
+                        except Exception as e:
+                            print("  [WARN] Failed to colorize panel {0}: {1}".format(p.get("panel_name", "?"), e))
 
                 if SHOW_CUTOUTS:
                     for c in p["cutouts"]:

@@ -374,6 +374,11 @@ class ConfigDialog(Form):
         ]:
             y = self._num_row(y, lbl, val, attr)
 
+        _cur_floor = getattr(self._cfg.optimization_strategy, "limit_panel_height_to_floor", False)
+        y = self._radio_row(y, "Limit Panel Height to Floor",
+                            ["No", "Yes (Floor-to-Floor)"],
+                            "Yes (Floor-to-Floor)" if _cur_floor else "No", "_rb_floor_h")
+
 
         # TAB 3: Clearances
         tab_clr = TabPage("3. Clearances")
@@ -943,6 +948,9 @@ class ConfigDialog(Form):
         os_.nu_weight = os_.unique_weight
         os_.np_weight = 1.0
 
+        os_.horizontal_to_vertical_threshold_in = self._flt("_txt_swap_thresh", 143.0)
+        os_.limit_panel_height_to_floor = ("Yes" in self._selected("_rb_floor_h"))
+
         # Opening alignment strategy
         _align_map = {
             "Opening-Derived Width": "opening_derived",
@@ -959,8 +967,6 @@ class ConfigDialog(Form):
             "Identical (match standard W)": "standardise",
         }
         os_.nonwindow_strategy = _nw_map.get(self._selected("_rb_nw"), "largest")
-
-        os_.horizontal_to_vertical_threshold_in = self._flt("_txt_swap_thresh", 143.0)
 
         self.DialogResult = DialogResult.OK
         self.Close()

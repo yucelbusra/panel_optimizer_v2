@@ -292,7 +292,7 @@ try:
             print("  No basic walls to export.")
         else:
             levels        = list(FilteredElementCollector(doc).OfClass(Level))
-            level_elev_in = sorted([int(round(l.Elevation * 12)) for l in levels])
+            level_elev_in = sorted([round(l.Elevation * 12.0, 4) for l in levels])
             
             _all_doc_walls = list(FilteredElementCollector(doc).OfClass(Wall).WhereElementIsNotElementType())
 

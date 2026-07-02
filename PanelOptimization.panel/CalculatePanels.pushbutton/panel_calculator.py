@@ -171,7 +171,8 @@ class OptimizationStrategy(object):
                  void1_x_offset_left=6.0, nonwindow_strategy="largest",
                  np_weight=1.0, nu_weight=10.0,
                  best_to_manufacture=False, unique_weight=10.0,
-                 merge_tolerance_in=0.0):
+                 merge_tolerance_in=0.0,
+                 limit_panel_height_to_floor=False):
         
         self.prioritize_coverage       = bool(prioritize_coverage)
         self.allow_vertical_stacking   = bool(allow_vertical_stacking)
@@ -189,6 +190,7 @@ class OptimizationStrategy(object):
         self.best_to_manufacture       = bool(best_to_manufacture)
         self.unique_weight             = float(unique_weight)
         self.merge_tolerance_in        = float(merge_tolerance_in)
+        self.limit_panel_height_to_floor = bool(limit_panel_height_to_floor)
 
 class OptimizerConfig(object):
     def __init__(self, project_name="Default Project", panel_constraints=None,
@@ -254,7 +256,8 @@ class OptimizerConfig(object):
                 "unique_weight": getattr(os, "unique_weight", 10.0),
                 "np_weight": getattr(os, "np_weight", 1.0),
                 "nu_weight": getattr(os, "nu_weight", 10.0),
-                "merge_tolerance_in": getattr(os, "merge_tolerance_in", 0.0)
+                "merge_tolerance_in": getattr(os, "merge_tolerance_in", 0.0),
+                "limit_panel_height_to_floor": getattr(os, "limit_panel_height_to_floor", False)
             }
         }
 
@@ -307,7 +310,8 @@ class OptimizerConfig(object):
                 nu_weight=os_.get("nu_weight", os_.get("unique_weight", 10.0)),
                 best_to_manufacture=os_.get("best_to_manufacture", False),
                 unique_weight=os_.get("unique_weight", 10.0),
-                merge_tolerance_in=os_.get("merge_tolerance_in", 0.0)
+                merge_tolerance_in=os_.get("merge_tolerance_in", 0.0),
+                limit_panel_height_to_floor=os_.get("limit_panel_height_to_floor", False)
             )
         )
 
@@ -744,6 +748,57 @@ def panel_overlaps_clearance(panel, openings, constraints, allow_intentional=Fal
     return False
 
 
+def fill_horizontal_courses(x0, x1, y0, y1, panels, panel_counter,
+                            constraints, all_openings):
+    """Fill the rectangle [x0,x1] x [y0,y1] with HORIZONTAL panels: stacked
+    courses, each no taller than short_max, width-tiled up to long_max. Course
+    heights are EQUAL-split so the region is fully covered with no sub-minimum
+    remainder at the top. Used above (and optionally below) a blocking storefront
+    when the wall is placed vertically, so the spandrel band over a wide
+    storefront becomes wide horizontal panels instead of short vertical slivers."""
+    import math
+    minw = constraints.min_width
+    minh = constraints.min_height
+    SHORT = constraints.short_max
+    LONG = constraints.long_max
+    sp = float(getattr(constraints, "panel_spacing", 0.0) or 0.0)
+
+    W = x1 - x0
+    H = y1 - y0
+    if W < minw or H < minh:
+        return panel_counter
+
+    # number of equal courses so each <= short_max, then height split to fill H
+    n = max(1, int(math.ceil((H + sp) / (SHORT + sp))))
+    course_h = (H - (n - 1) * sp) / float(n)
+    while course_h < minh and n > 1:
+        n -= 1
+        course_h = (H - (n - 1) * sp) / float(n)
+
+    y = y0
+    for _ci in range(n):
+        x = x0
+        while x < x1 - 1e-6:
+            rem = x1 - x
+            if rem < minw:
+                row = [p for p in panels if abs(p.y - y) < 0.01 and p.x >= x0]
+                if row and (row[-1].w + sp + rem) <= LONG:
+                    row[-1].w = round(row[-1].w + sp + rem, 6)
+                    row[-1].cutouts = calculate_panel_cutouts(row[-1], all_openings)
+                break
+            pw = rem if rem <= LONG else LONG
+            if 0 < (rem - pw) < (minw + sp):
+                pw = rem - (minw + sp)
+            cand = Panel(round(x, 6), round(y, 6), round(pw, 6), round(course_h, 6),
+                         "PH{:02d}".format(panel_counter))
+            cand.cutouts = calculate_panel_cutouts(cand, all_openings)
+            panels.append(cand)
+            panel_counter += 1
+            x += pw + sp
+        y += course_h + sp
+    return panel_counter
+
+
 def fill_vertical_gap(region_x_start, region_x_end, gap_y_start, gap_y_end,
                       opening_left, opening_right, panels, panel_counter,
                       constraints, all_openings, label,
@@ -1016,14 +1071,25 @@ def _core_place_panels_sequential(wall_width, wall_height, openings, constraints
         region_openings = region['openings']
         bands = []
         if horizontal_mode:
-            cy = 0
-            while cy < wall_height:
-                rem_h = wall_height - cy
-                bh = snap_down(min(rem_h, SHORT_MAX), DIMENSION_INCREMENT)
-                if bh >= PANEL_HEIGHT_MIN:
-                    bands.append((cy, cy + bh))
-                    cy += bh
-                else: break
+            # [FIX] Greedy Y-bands instead of equal splitting.
+            # Equal-height courses cause seams to cut directly through windows.
+            # Now we maximize the lower panel (up to SHORT_MAX) to cover windows,
+            # and push the remaining sliver into a PANEL_HEIGHT_MIN panel at the top.
+            _cy = 0.0
+            while _cy < wall_height:
+                rem_h = wall_height - _cy
+                if rem_h > SHORT_MAX and (rem_h - SHORT_MAX) < PANEL_HEIGHT_MIN:
+                    bh = snap_down(rem_h - PANEL_HEIGHT_MIN, DIMENSION_INCREMENT)
+                else:
+                    bh = snap_down(min(rem_h, SHORT_MAX), DIMENSION_INCREMENT)
+                    
+                if bh < PANEL_HEIGHT_MIN:
+                    if bands: bands[-1] = (bands[-1][0], wall_height)
+                    else: bands.append((0, wall_height))
+                    break
+                    
+                bands.append((round(_cy, 4), round(_cy + bh, 4)))
+                _cy += bh
         else:
             bands = [(region['y_start'], region['y_end'])]
 
@@ -1032,6 +1098,9 @@ def _core_place_panels_sequential(wall_width, wall_height, openings, constraints
             # Subtract spacing from the band height to create the Y-axis reveal!
             raw_h = y_end - y_start
             band_height = raw_h - spacing if (raw_h - spacing) >= PANEL_HEIGHT_MIN else raw_h
+            
+            # --- FIX 1: ROUND BAND HEIGHT TO ERASE DRIFT ---
+            band_height = round(band_height, 3)
             
             max_width_for_band = SHORT_MAX if band_height > SHORT_MAX else LONG_MAX
             x_cursor = max(0.0, region['x_start'])
@@ -1044,12 +1113,16 @@ def _core_place_panels_sequential(wall_width, wall_height, openings, constraints
                     band_panels = [p for p in panels if abs(p.y - y_start) < 0.01]
                     if band_panels:
                         last = band_panels[-1]
-                        extended_w = round(last.w + spacing + remaining_wall, 8)
+                        
+                        # --- FIX 2: ROUND WIDENED PANEL EXTENSION ---
+                        extended_w = round(last.w + spacing + remaining_wall, 3) 
+                        
                         if extended_w <= max_width_for_band:
                             last.w = extended_w
                             last.cutouts = calculate_panel_cutouts(last, region_openings)
                         else:
-                            snap_w = round(remaining_wall, 8)
+                            # --- FIX 3: ROUND REMAINDER SLIVER ---
+                            snap_w = round(remaining_wall, 3) 
                             candidate = Panel(x_cursor, y_start, snap_w, band_height, "P{:02d}".format(panel_counter))
                             candidate.cutouts = calculate_panel_cutouts(candidate, region_openings)
                             panels.append(candidate)
@@ -1076,6 +1149,10 @@ def _core_place_panels_sequential(wall_width, wall_height, openings, constraints
 
                     if can_bridge:
                         panel_w = snap_down(bridge_dist, DIMENSION_INCREMENT)
+                        
+                        # --- FIX 4: ROUND BRIDGED PANEL ---
+                        panel_w = round(panel_w, 3)
+                        
                         candidate = Panel(x_cursor, y_start, panel_w, band_height, "P{:02d}".format(panel_counter))
                         candidate.cutouts = calculate_panel_cutouts(candidate, region_openings)
                         panels.append(candidate)
@@ -1113,8 +1190,12 @@ def _core_place_panels_sequential(wall_width, wall_height, openings, constraints
 
                 # Check for jamb clashes and adjust
                 for op in region_openings:
+                    if (op.top_clearance_zone <= y_start or op.bottom_clearance_zone >= y_end):
+                        continue
+                        
                     if (op.left_clearance_zone + 0.1) < candidate_right < (op.right_clearance_zone - 0.1):
                         dist_to_left_jamb = op.left_clearance_zone - x_cursor
+
                         if dist_to_left_jamb >= PANEL_WIDTH_MIN:
                             panel_w = snap_down(dist_to_left_jamb, DIMENSION_INCREMENT)
                         else:
@@ -1125,6 +1206,9 @@ def _core_place_panels_sequential(wall_width, wall_height, openings, constraints
                         break
 
                 if not is_valid_panel(panel_w, band_height, constraints): break
+
+                # --- FIX 5: ROUND FINAL GRID PANEL ---
+                panel_w = round(panel_w, 3)
 
                 candidate = Panel(x_cursor, y_start, panel_w, band_height, "P{:02d}".format(panel_counter))
                 candidate.cutouts = calculate_panel_cutouts(candidate, region_openings)
@@ -1176,14 +1260,21 @@ def _core_place_panels_sequential(wall_width, wall_height, openings, constraints
             gap_height = wall_height - sf.top_clearance_zone
             if gap_height >= PANEL_HEIGHT_MIN:
                 before_count = len(panels)
-                panel_counter = fill_vertical_gap(
-                    sf.left_clearance_zone, sf.right_clearance_zone,
-                    sf.top_clearance_zone, wall_height,
-                    sf.left_clearance_zone, sf.right_clearance_zone,
-                    panels, panel_counter, constraints, sorted_openings,
-                    "above",
-                    True
-                )
+                if not horizontal_mode:
+                    # vertical wall -> spandrel over the storefront is HORIZONTAL panels
+                    panel_counter = fill_horizontal_courses(
+                        sf.left_clearance_zone, sf.right_clearance_zone,
+                        sf.top_clearance_zone, wall_height,
+                        panels, panel_counter, constraints, sorted_openings)
+                else:
+                    panel_counter = fill_vertical_gap(
+                        sf.left_clearance_zone, sf.right_clearance_zone,
+                        sf.top_clearance_zone, wall_height,
+                        sf.left_clearance_zone, sf.right_clearance_zone,
+                        panels, panel_counter, constraints, sorted_openings,
+                        "above",
+                        True
+                    )
                 extra_filled += len(panels) - before_count
         
         # Fill BELOW
@@ -1202,7 +1293,6 @@ def _core_place_panels_sequential(wall_width, wall_height, openings, constraints
                 extra_filled += len(panels) - before_count
 
     return panels
-
     
 def _place_ga_optimized(wall_width, wall_height, openings, constraints, orientation, strategy):
     print(Ansi.MAGENTA + "  [EXECUTE] Solving for Min Total + Unique (GA)..." + Ansi.RESET)
@@ -1609,6 +1699,65 @@ def _clip_openings_to_band(openings, y0_in, y1_in):
     return result
 
 
+def _floor_bands(wall_h, rel_elevs, min_band=24.0, max_band=None):
+    """One band per storey: slice the wall at every interior level elevation so
+    each panel spans floor-to-floor. Used when 'limit panel height to floor' is on.
+
+    Coverage runs base (0) -> true wall top (wall_h), so a parapet above the top
+    level is included. Two corrections keep every band fabricable AND covered:
+      * A band shorter than min_band (a sub-fabricable remnant, e.g. a short
+        parapet) is MERGED into its neighbour rather than dropped.
+      * A band taller than max_band (e.g. a merged floor+parapet that exceeds the
+        horizontal Short Max) is SPLIT into equal legal courses rather than
+        capped-and-dropped. Pass max_band = short_max for horizontal,
+        long_max for vertical.
+    The only departures from exact floor-to-floor are these two cases, and both
+    exist solely to cover the wall with buildable panels."""
+    import math
+    bnds = [0.0] + [float(e) for e in rel_elevs if 0.0 < float(e) < wall_h] + [float(wall_h)]
+    bnds = sorted(set(round(b, 4) for b in bnds))
+    # Merge any band below the minimum fabricable height into its neighbour.
+    changed = True
+    while changed and len(bnds) > 2:
+        changed = False
+        for i in range(len(bnds) - 1):
+            if (bnds[i + 1] - bnds[i]) < min_band:
+                if i + 1 < len(bnds) - 1:
+                    del bnds[i + 1]
+                else:
+                    del bnds[i]
+                changed = True
+                break
+    bands = [(bnds[i], bnds[i + 1]) for i in range(len(bnds) - 1)] or [(0.0, round(wall_h, 4))]
+    # [FIX] Split any band taller than the max panel height greedily, pushing min_band to the top.
+    if max_band and max_band > 0:
+        out = []
+        for a, b in bands:
+            h = b - a
+            if h > max_band + 1e-6:
+                cy = a
+                while cy < b:
+                    rem_h = b - cy
+                    if rem_h > max_band and (rem_h - max_band) < min_band:
+                        bh = rem_h - min_band
+                    else:
+                        bh = min(rem_h, max_band)
+                        
+                    if bh < min_band:
+                        if out and out[-1][1] == cy:
+                            out[-1] = (out[-1][0], b)
+                        else:
+                            out.append((cy, b))
+                        break
+                        
+                    out.append((round(cy, 4), round(cy + bh, 4)))
+                    cy += bh
+            else:
+                out.append((a, b))
+        bands = out
+    return bands
+
+
 def _compute_elevation_bands(wall_h, rel_elevs, max_ph):
     """
     Greedy band builder: place the tallest possible panel (up to max_ph),
@@ -1623,8 +1772,16 @@ def _compute_elevation_bands(wall_h, rel_elevs, max_ph):
 
     Always guarantees every band height <= max_ph.
     """
-    if not rel_elevs or wall_h <= max_ph + 6.0:
+    if wall_h <= max_ph + 6.0:
         return [(0.0, round(wall_h, 4))]
+    if not rel_elevs:
+        # No interior levels but the wall is taller than one panel: split into
+        # equal bands, each <= max_ph, so vertical panels stay within Long Max
+        # and the whole wall is covered (previously returned one over-tall band).
+        import math
+        n = int(math.ceil(wall_h / float(max_ph)))
+        step = wall_h / float(n)
+        return [(round(k * step, 4), round((k + 1) * step, 4)) for k in range(n)]
 
     bands    = []
     pos      = 0.0
@@ -1728,11 +1885,17 @@ def _place_minimize_unique(wall_width, wall_height, openings, constraints,
         cy = 0
         inc = constraints.dimension_increment
         short_max = constraints.short_max
+        min_h = constraints.min_height
+        
         while cy < total_h:
             rem_h = total_h - cy
-            max_h_allow = min(rem_h, short_max)
-            bh = math.floor(max_h_allow / inc) * inc
-            if bh < constraints.min_height:
+            # [FIX] Maximize lower panel, force min_height remainder on top
+            if rem_h > short_max and (rem_h - short_max) < min_h:
+                bh = math.floor((rem_h - min_h) / inc) * inc
+            else:
+                bh = math.floor(min(rem_h, short_max) / inc) * inc
+                
+            if bh < min_h:
                 if bands: bands[-1] = (bands[-1][0], total_h)
                 else: bands.append((0, total_h))
                 break
@@ -1888,7 +2051,8 @@ def _place_minimize_unique(wall_width, wall_height, openings, constraints,
         actual_zone_end = actual_zone_start
 
         for i in range(n_panels):
-            panel_x = round(actual_zone_start + i * (standard_w + constraints.panel_spacing), 8)
+            # --- FIX: ROUND GRID ANCHOR TO 3 DECIMALS ---
+            panel_x = round(actual_zone_start + i * (standard_w + constraints.panel_spacing), 3) 
             actual_w = standard_w
             if panel_x + actual_w > wall_width:
                 actual_w = wall_width - panel_x
@@ -1899,6 +2063,10 @@ def _place_minimize_unique(wall_width, wall_height, openings, constraints,
                 # --- FIX: VERTICAL SPACING ---
                 raw_h = y_e - y_s
                 actual_h = raw_h - constraints.panel_spacing if (raw_h - constraints.panel_spacing) >= constraints.min_height else raw_h
+                
+                # --- FIX: ROUND HEIGHT AND WIDTH TO 3 DECIMALS ---
+                actual_w = round(actual_w, 3)
+                actual_h = round(actual_h, 3)
                 
                 p = Panel(panel_x, y_s, actual_w, actual_h, 'P{:02d}'.format(panel_counter))
                 panel_counter += 1
@@ -1948,7 +2116,8 @@ def _place_minimize_unique(wall_width, wall_height, openings, constraints,
                 
                 if can_widen:
                     for ap in adjacent_panels:
-                        ap.w += u_width
+                        # --- FIX: ROUND WIDENED PANEL EXTENSION TO 3 DECIMALS ---
+                        ap.w = round(ap.w + u_width, 3)
                         ap.cutouts = calculate_panel_cutouts(ap, openings)
                     continue
         
@@ -1985,21 +2154,10 @@ def _place_minimize_unique(wall_width, wall_height, openings, constraints,
         while i < len(band_panels):
             curr_p = band_panels[i]
             
-            # If the panel has a cutout, it MUST remain anchored. Skip it.
-            if getattr(curr_p, 'cutouts', []):
-                welded_panels.append(curr_p)
-                i += 1
-                continue
-                
-            # If solid, look ahead to the next panels to see if we can weld them
             j = i + 1
             while j < len(band_panels):
                 next_p = band_panels[j]
                 
-                # Cannot weld if the next panel has a window/cutout
-                if getattr(next_p, 'cutouts', []):
-                    break
-                    
                 # Cannot weld if they are not physically adjacent
                 if abs((curr_p.x + curr_p.w + spacing) - next_p.x) > 0.1:
                     break
@@ -2008,8 +2166,27 @@ def _place_minimize_unique(wall_width, wall_height, openings, constraints,
                 if (curr_p.w + spacing + next_p.w) > global_max_w:
                     break
                     
+                # LIMIT: Prevent panels from swallowing more than 2 cutouts total!
+                curr_cutout_count = len(getattr(curr_p, 'cutouts', []) or [])
+                next_cutout_count = len(getattr(next_p, 'cutouts', []) or [])
+                if curr_cutout_count + next_cutout_count > 2:
+                    break
+                    
                 # MERGE! Absorb the next panel's width and the spacing gap
-                curr_p.w += (spacing + next_p.w)
+                old_w = curr_p.w
+                # --- FIX: ROUND THE WELDED PANEL WIDTH TO 3 DECIMALS ---
+                curr_p.w = round(curr_p.w + spacing + next_p.w, 3) 
+                
+                # Merge the cutouts and shift their local X coordinates
+                if getattr(next_p, 'cutouts', []):
+                    if not getattr(curr_p, 'cutouts', []):
+                        curr_p.cutouts = []
+                    for c in next_p.cutouts:
+                        c_new = c.copy()
+                        c_new['x_in'] += (old_w + spacing)
+                        c_new['raw_x_in'] += (old_w + spacing)
+                        curr_p.cutouts.append(c_new)
+                        
                 j += 1
                 
             welded_panels.append(curr_p)
@@ -2023,6 +2200,202 @@ def _place_minimize_unique(wall_width, wall_height, openings, constraints,
     return welded_panels
 
         
+def _rebuild_aligned_columns(records, ext_openings, eff_w, constraints):
+    """Re-tile solid piers and storefront spandrels so stacked courses share
+    joints, WITHOUT slicing existing panels (which bred junk widths before).
+
+    Partition the wall in x into solid piers and blocker spans. Solid piers are
+    re-tiled once (equal division <= max_width) and that single division is used
+    for EVERY course in the pier -> joints stack. A blocker span is re-tiled only
+    for the courses above the storefront's head (the spandrel); the glazed part
+    gets no panel. Because piers/storefronts of equal width divide identically,
+    the type count stays about the same. Segments containing a regular window are
+    left untouched (kept as originally placed) so cutouts are preserved."""
+    import math
+    sp = float(getattr(constraints, "panel_spacing", 0.0) or 0.0)
+    maxw = constraints.max_width
+    minw = constraints.min_width
+
+    blockers = []
+    for o in ext_openings:
+        try:
+            req = o.w + o.original_clearances.jamb_min * 2.0
+        except Exception:
+            req = o.w
+        if req > maxw:
+            blockers.append((max(0.0, o.x - sp), o.x + o.w + sp, o.y + o.h))
+    if not blockers:
+        return records
+    blockers.sort()
+
+    # regular (non-blocking) openings -> segments overlapping these are left as-is
+    reg = []
+    for o in ext_openings:
+        try:
+            req = o.w + o.original_clearances.jamb_min * 2.0
+        except Exception:
+            req = o.w
+        if req <= maxw:
+            reg.append((o.left_clearance_zone, o.right_clearance_zone))
+
+    def divide(width):
+        n = max(1, int(math.ceil((width + sp) / (maxw + sp))))
+        pw = (width - (n - 1) * sp) / float(n)
+        return [(i * (pw + sp), pw) for i in range(n)]
+
+    # courses present on solid full-height piers = distinct (y,h) of solid records
+    courses = sorted(set((round(r["y_in"], 3), round(r["height_in"], 3))
+                         for r in records if not r["cutouts_json"]))
+    if not courses:
+        return records
+    tmpl = records[0]
+
+    def mk(x, y, w, h):
+        r = dict(tmpl)
+        r["x_in"] = round(x, 4); r["y_in"] = round(y, 4)
+        r["width_in"] = round(w, 4); r["height_in"] = round(h, 4)
+        r["x_ref"] = round(x, 4); r["area_in2"] = round(w * h, 4)
+        r["panel_type"] = "{}x{}".format(round(w, 4), round(h, 4))
+        r["cutouts_json"] = ""
+        return r
+
+    # x-partition
+    bnds = sorted(set([0.0, round(eff_w, 3)]
+                      + [b[0] for b in blockers] + [b[1] for b in blockers]))
+    new = []
+    kept_ranges = []
+    for i in range(len(bnds) - 1):
+        a, b = bnds[i], bnds[i + 1]
+        w = b - a
+        if w < minw:
+            continue
+        # segment overlaps a regular window? -> keep original records here
+        if any(not (rr <= a + 0.5 or rl >= b - 0.5) for (rl, rr) in reg):
+            kept_ranges.append((a, b))
+            continue
+        blk = None
+        for bl in blockers:
+            if bl[0] - 0.5 <= a and b <= bl[1] + 0.5:
+                blk = bl; break
+        div = divide(w)
+        for (cy, ch) in courses:
+            if blk is not None and (cy + ch * 0.5) < blk[2] - 1.0:
+                continue  # this course is behind the glazing -> no panel
+            for (off, pw) in div:
+                new.append(mk(a + off, cy, pw, ch))
+
+    # keep original records that fall in a window-bearing segment
+    for r in records:
+        cx = r["x_in"] + r["width_in"] * 0.5
+        if any(a <= cx <= b for (a, b) in kept_ranges):
+            new.append(r)
+    return new
+
+
+def _align_courses_to_piers(records, ext_openings, eff_w, constraints):
+    """Re-tile stacked courses so joints stack over solid piers.
+
+    A wall taller than one panel is placed as separate elevation courses that
+    tile their widths independently, so the course above a pier lands on a
+    different module than the pier below -> staggered joints. This pass re-tiles
+    each course region-by-region using ONE canonical division per span, so the
+    same pier width divides the same way in every course (joints stack). Spans
+    over storefront glazing are tiled on their own. A span that contains a real
+    window (regular opening) is left exactly as placed, so cutouts are never
+    disturbed. Walls with no blocking openings return unchanged."""
+    import math
+    sp = float(getattr(constraints, "panel_spacing", 0.0) or 0.0)
+    maxw = constraints.max_width
+    minw = constraints.min_width
+    if not records:
+        return records
+
+    # blocker x-spans (storefronts / wide doors), merged
+    bl = []
+    for o in ext_openings:
+        try:
+            req = o.w + o.original_clearances.jamb_min * 2.0
+        except Exception:
+            req = o.w
+        if req > maxw:
+            bl.append((o.x - sp, o.x + o.w + sp))
+    if not bl:
+        return records
+    bl.sort()
+    merged = []
+    for l, r in bl:
+        if merged and l <= merged[-1][1] + 0.5:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], r))
+        else:
+            merged.append([l, r])
+    bl = merged
+
+    # pier edges = every blocker boundary (these are the shared joint lines)
+    pier_edges = sorted(set([round(e, 3) for span in bl for e in span]))
+
+    # regular (non-blocking) opening x-spans -> spans we must NOT re-tile
+    reg_spans = []
+    for o in ext_openings:
+        try:
+            req = o.w + o.original_clearances.jamb_min * 2.0
+        except Exception:
+            req = o.w
+        if req <= maxw:
+            reg_spans.append((o.left_clearance_zone, o.right_clearance_zone))
+
+    def has_window(a, b):
+        return any(not (rr <= a + 0.5 or rl >= b - 0.5) for (rl, rr) in reg_spans)
+
+    def divide(a, b):
+        W = b - a
+        n = max(1, int(math.ceil((W + sp) / (maxw + sp))))
+        pw = (W - (n - 1) * sp) / float(n)
+        return [(round(a + i * (pw + sp), 4), round(pw, 4)) for i in range(n)]
+
+    def mk(tmpl, x, y, w, h, wid):
+        r = dict(tmpl)
+        r.update(x_in=round(x, 4), y_in=round(y, 4), width_in=round(w, 4),
+                 height_in=round(h, 4), x_ref=round(x, 4),
+                 area_in2=round(w * h, 4),
+                 panel_type="{}x{}".format(round(w, 4), round(h, 4)),
+                 cutouts_json="", wall_id=wid)
+        return r
+
+    # group into courses (same y, same height)
+    courses = {}
+    for r in records:
+        courses.setdefault((round(r["y_in"], 2), round(r["height_in"], 2)), []).append(r)
+
+    out = []
+    for (y, h), panels in courses.items():
+        wid = panels[0]["wall_id"]
+        # contiguous solid runs this course actually covers (respecting glazing gaps)
+        segs = sorted((p["x_in"], p["x_in"] + p["width_in"]) for p in panels)
+        runs = []
+        for x0, x1 in segs:
+            if runs and x0 <= runs[-1][1] + sp + 0.6:
+                runs[-1][1] = max(runs[-1][1], x1)
+            else:
+                runs.append([x0, x1])
+        for rx0, rx1 in runs:
+            # break each run at pier edges that fall inside it
+            pts = [rx0, rx1] + [e for e in pier_edges if rx0 + 0.6 < e < rx1 - 0.6]
+            pts = sorted(set(round(p, 3) for p in pts))
+            for i in range(len(pts) - 1):
+                a, b = pts[i], pts[i + 1]
+                if b - a < minw - 0.01:
+                    continue
+                if has_window(a, b):
+                    # keep original panels overlapping this span untouched
+                    for p in panels:
+                        if p["x_in"] >= a - 0.6 and (p["x_in"] + p["width_in"]) <= b + 0.6:
+                            out.append(p)
+                else:
+                    for (ox, ow) in divide(a, b):
+                        out.append(mk(panels[0], ox, y, ow, h, wid))
+    return out
+
+
 def process_all_walls(walls_rows, openings_rows, output_dir,
                       door_clearances, window_clearances, storefront_clearances,
                       config=None, orientation="vertical", output_filename="optimized_panel_placement.csv",
@@ -2125,7 +2498,12 @@ def process_all_walls(walls_rows, openings_rows, output_dir,
         try: _lvl_abs_in = json.loads(wall_row.get("LevelElevations(in)", "[]"))
         except: _lvl_abs_in = []
         _rel_elevs = sorted({round(e - _base_z_in, 2) for e in _lvl_abs_in if 6.0 < (e - _base_z_in) < (_wall_h_in - 6.0)})
-        _bands = _compute_elevation_bands(_wall_h_in, _rel_elevs, _max_ph_in)
+        if getattr(ACTIVE_CONFIG.optimization_strategy, 'limit_panel_height_to_floor', False):
+            _pc = ACTIVE_CONFIG.panel_constraints
+            _max_band = _pc.short_max if str(orientation).lower() == 'horizontal' else _pc.long_max
+            _bands = _floor_bands(_wall_h_in, _rel_elevs, _pc.min_height, _max_band)
+        else:
+            _bands = _compute_elevation_bands(_wall_h_in, _rel_elevs, _max_ph_in)
 
         panel_records = []
         for _y0, _y1 in _bands:
@@ -2134,6 +2512,9 @@ def process_all_walls(walls_rows, openings_rows, output_dir,
             _band_recs = process_wall(wall_id, _eff_wall_w, _band_h_in, _band_ops)
             for _r in _band_recs: _r["y_in"] = round(_r["y_in"] + _y0, 4)
             panel_records.extend(_band_recs)
+        if str(orientation).lower() != 'horizontal':
+            panel_records = _align_courses_to_piers(
+                panel_records, _ext_openings, _eff_wall_w, ACTIVE_CONFIG.panel_constraints)
         for _idx, _r in enumerate(panel_records, start=1): _r["panel_name"] = "P{:02d}".format(_idx)
 
         # Shift x_in back to wall_origin coordinates
