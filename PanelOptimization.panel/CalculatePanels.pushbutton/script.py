@@ -363,6 +363,10 @@ class ConfigDialog(Form):
 
         _cur_swap = getattr(self._cfg.optimization_strategy, "horizontal_to_vertical_threshold_in", 143.0)
         y = self._num_row(y, "Auto-Vertical Threshold for Horizontal Mode (in)", _cur_swap, "_txt_swap_thresh")
+
+        # --- NEW UI ELEMENT ---
+        _cur_flex = getattr(self._cfg.optimization_strategy, "flexible_top_panel_allowance_in", 24.0)
+        y = self._num_row(y, "Flexible Top Panel Allowance (Absorb Parapet) (in)", _cur_flex, "_txt_flex_top")
         
         y = self._section(y, "Manufacturing Dimensions")
         pc = self._cfg.panel_constraints
@@ -950,6 +954,7 @@ class ConfigDialog(Form):
 
         os_.horizontal_to_vertical_threshold_in = self._flt("_txt_swap_thresh", 143.0)
         os_.limit_panel_height_to_floor = ("Yes" in self._selected("_rb_floor_h"))
+        os_.flexible_top_panel_allowance_in     = self._flt("_txt_flex_top", 24.0)
 
         # Opening alignment strategy
         _align_map = {

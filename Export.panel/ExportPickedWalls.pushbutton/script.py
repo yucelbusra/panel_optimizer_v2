@@ -112,7 +112,8 @@ def level_name(elem):
 def get_single_wall_geometry(wall):
     """
     Compute the true visual-left -> visual-right extent of a single wall.
-    Accurately extracts Z-elevation using BoundingBox for Stacked Wall members.
+    AUTO-CORRECTS ghost geometry caused by Revit wall joins by trimming 
+    the analytical line to the physical Bounding Box.
     """
     if not wall: return None
 
@@ -127,28 +128,46 @@ def get_single_wall_geometry(wall):
     except Exception:
         visual_right_dir = XYZ(1, 0, 0)
 
-    # Calculate absolute X/Y span
+    # Calculate absolute X/Y span based on analytical curve
     all_pts = [p0, p1]
     start_pt = min(all_pts, key=lambda p: p.DotProduct(visual_right_dir))
     end_pt   = max(all_pts, key=lambda p: p.DotProduct(visual_right_dir))
-
     vec = (end_pt - start_pt).Normalize()
-
-    # --- FIX: True Absolute Z-Elevation for Stacked Wall Members ---
-    # Do not trust Location.Curve Z for sub-walls. Pull the true physical BoundingBox.
+    
+    # --- THE CLASH FIX: PHYSICAL CROP ---
     try:
         bb = wall.get_BoundingBox(None)
         if bb:
             min_z = bb.Min.Z
             max_z = bb.Max.Z
+            
+            # Project all 4 corners of the bounding box onto the wall vector
+            # to find the TRUE physical start and end points
+            bb_pts = [
+                XYZ(bb.Min.X, bb.Min.Y, 0), XYZ(bb.Max.X, bb.Min.Y, 0),
+                XYZ(bb.Min.X, bb.Max.Y, 0), XYZ(bb.Max.X, bb.Max.Y, 0)
+            ]
+            projections = [(p - start_pt).DotProduct(vec) for p in bb_pts]
+            p_min = min(projections)
+            p_max = max(projections)
+            
+            # Trim the analytical points to the physical limits
+            # This deletes the "ghost overlap" created by Revit's join engine
+            actual_start_pt = start_pt + (vec * p_min)
+            actual_end_pt   = start_pt + (vec * p_max)
+            
+            start_pt = actual_start_pt
+            end_pt   = actual_end_pt
+            analytical_length = p_max - p_min
         else:
-            # Fallback if BB fails
             min_z = min(p.Z for p in all_pts)
             h = wall.get_Parameter(BuiltInParameter.WALL_USER_HEIGHT_PARAM).AsDouble()
             max_z = min_z + (h if h else 10.0)
+            analytical_length = lc.Length
     except Exception:
         min_z = min(p.Z for p in all_pts)
         max_z = min_z
+        analytical_length = lc.Length
 
     # Re-map the start and end points to the true absolute Z plane
     start_pt = XYZ(start_pt.X, start_pt.Y, min_z)
@@ -160,7 +179,7 @@ def get_single_wall_geometry(wall):
         'direction': vec,
         'height':    max_z - min_z,
         'min_z':     min_z,
-        'length':    lc.Length
+        'length':    analytical_length
     }
 
 def _normalize_xy(v):
@@ -268,6 +287,299 @@ for wall in basic_walls:
 
 print("  {} individual wall(s) queued for export.".format(len(_group_data)))
 
+# ========== MERGE COPLANAR WALLS INTO CONTINUOUS FACADES ==========
+# Revit users often draw a single physical facade as several separate walls
+# with no offset between them. Panel placement can't span an artificial seam,
+# so tall panels get chopped short. Fold every run of perfectly-aligned walls
+# into one virtual facade before export.
+#
+# Two seam directions are supported:
+#
+#   HORIZONTAL SEAM  -- side-by-side along the facade length. Two walls have
+#     the same base/top Z, meet at an XY endpoint, and lie on the same
+#     infinite line in plan. Merging extends the length; height stays.
+#
+#   VERTICAL STACK   -- one wall sits on top of another (per-floor walls, or
+#     the members Revit unpacks out of a Stacked Wall). Two walls share the
+#     same XY footprint (start and end match in X and Y), and the top of one
+#     lands on the base of the other in Z. Merging keeps the footprint and
+#     sums the heights.
+#
+# In both cases all of the following must also match:
+#   - wall thickness (Width parameter)
+#   - outward normal (Orientation)
+#   - visual left->right direction axis
+# If anything fails, walls stay separate -- so intentional insets, steps,
+# thickness changes, and gaps are always preserved.
+
+
+_TOL_DIST   = 0.05     # ~5/8 inch. Loose enough for typical Revit noise;
+                       # tight enough that a real inset (> ~1 inch) stays split.
+_TOL_PERP   = 0.05     # colinearity in plan, same generosity
+_TOL_THICK  = 0.001    # in feet
+_TOL_DOT    = 0.9995   # ~1.8 degrees of angular slack
+ 
+ 
+def _shared_type_checks(gd_a, gd_b):
+    """Thickness + normal + direction-axis. Common to any merge kind."""
+    ga, gb = gd_a['geo'], gd_b['geo']
+ 
+    if ga['direction'].DotProduct(gb['direction']) < _TOL_DOT:
+        return False
+ 
+    try:
+        if abs(gd_a['walls'][0].Width - gd_b['walls'][0].Width) > _TOL_THICK:
+            return False
+    except Exception:
+        return False
+ 
+    try:
+        n_a = gd_a['walls'][0].Orientation
+        n_b = gd_b['walls'][0].Orientation
+        if n_a.DotProduct(n_b) < _TOL_DOT:
+            return False
+    except Exception:
+        return False
+ 
+    return True
+ 
+ 
+def _proj_on_dir(pt, direction):
+    """Signed scalar position of pt along the horizontal direction axis."""
+    return pt.X * direction.X + pt.Y * direction.Y
+ 
+ 
+def _perp_from_line(line_start, line_dir, pt):
+    """Perpendicular (in-plan) distance from pt to the infinite line through
+    line_start with direction line_dir."""
+    _vx = pt.X - line_start.X
+    _vy = pt.Y - line_start.Y
+    return abs(_vx * line_dir.Y - _vy * line_dir.X)
+ 
+ 
+def _x_extent(geo):
+    """Projected (X-axis) low/high of a wall along its direction axis."""
+    _a = _proj_on_dir(geo['start'], geo['direction'])
+    _b = _proj_on_dir(geo['end'],   geo['direction'])
+    return (min(_a, _b), max(_a, _b))
+ 
+ 
+def _z_extent(geo):
+    return (geo['min_z'], geo['min_z'] + geo['height'])
+ 
+ 
+def _intervals_touch_or_overlap(a_lo, a_hi, b_lo, b_hi, tol):
+    """True iff two 1D intervals [a_lo,a_hi] and [b_lo,b_hi] overlap or are
+    within `tol` of touching."""
+    return (a_hi + tol >= b_lo) and (b_hi + tol >= a_lo)
+ 
+ 
+def _coplanar_mergeable(gd_a, gd_b):
+    """Return 'coplanar' if the two groups can be merged, or None if not.
+    All five criteria in the header comment must pass."""
+    if not _shared_type_checks(gd_a, gd_b):
+        return None
+ 
+    ga, gb = gd_a['geo'], gd_b['geo']
+ 
+    # (4) colinear in plan
+    if _perp_from_line(ga['start'], ga['direction'], gb['start']) > _TOL_PERP:
+        return None
+    if _perp_from_line(ga['start'], ga['direction'], gb['end']) > _TOL_PERP:
+        return None
+ 
+    # (5) rectangle union must be connected -- both X and Z intervals
+    #     have to touch or overlap. A gap on both axes = separate facades.
+    _ax_lo, _ax_hi = _x_extent(ga)
+    _bx_lo, _bx_hi = _x_extent(gb)
+    if not _intervals_touch_or_overlap(_ax_lo, _ax_hi, _bx_lo, _bx_hi, _TOL_DIST):
+        return None
+ 
+    _az_lo, _az_hi = _z_extent(ga)
+    _bz_lo, _bz_hi = _z_extent(gb)
+    if not _intervals_touch_or_overlap(_az_lo, _az_hi, _bz_lo, _bz_hi, _TOL_DIST):
+        return None
+ 
+    return "coplanar"
+ 
+ 
+def _merge_two_coplanar_groups(gd_a, gd_b, kind):
+    """Combine two aligned groups into the bounding rectangle of their union."""
+    _walls = gd_a['walls'] + gd_b['walls']
+    ga, gb = gd_a['geo'], gd_b['geo']
+    _d = ga['direction']
+ 
+    # X extent: leftmost and rightmost XY endpoints along the direction axis
+    _pts = [ga['start'], ga['end'], gb['start'], gb['end']]
+    _new_start_xy = min(_pts, key=lambda p: _proj_on_dir(p, _d))
+    _new_end_xy   = max(_pts, key=lambda p: _proj_on_dir(p, _d))
+    _new_length = ((_new_end_xy.X - _new_start_xy.X) ** 2 +
+                   (_new_end_xy.Y - _new_start_xy.Y) ** 2) ** 0.5
+ 
+    # Z extent: union of both walls' Z ranges
+    _new_min_z = min(ga['min_z'], gb['min_z'])
+    _new_top   = max(ga['min_z'] + ga['height'],
+                     gb['min_z'] + gb['height'])
+    _new_height = _new_top - _new_min_z
+ 
+    # Snap start/end Z to the new base so the geo dict follows the same
+    # convention as get_single_wall_geometry (both endpoints sit at min_z).
+    _new_start = XYZ(_new_start_xy.X, _new_start_xy.Y, _new_min_z)
+    _new_end   = XYZ(_new_end_xy.X,   _new_end_xy.Y,   _new_min_z)
+ 
+    _new_geo = {
+        'start':     _new_start,
+        'end':       _new_end,
+        'direction': _d,
+        'height':    _new_height,
+        'min_z':     _new_min_z,
+        'length':    _new_length,
+    }
+ 
+    _cid = min(w.Id.IntegerValue for w in _walls)
+    _label = "Facade_{}".format(_cid)
+    return {'walls': _walls, 'geo': _new_geo, 'id': _cid, 'label': _label}
+ 
+ 
+def _merge_coplanar_runs(group_data, wall_to_group):
+    """Iteratively fold every aligned run into one group. Re-scanning from
+    i=0 after any merge lets chains and mixed grids collapse all the way
+    through in as many passes as it takes."""
+    _merges = 0
+    _passes = 0
+    while _passes < 200:
+        _passes += 1
+        _merged_this_pass = False
+        _i = 0
+        while _i < len(group_data):
+            _j = _i + 1
+            _merged_i = False
+            while _j < len(group_data):
+                _kind = _coplanar_mergeable(group_data[_i], group_data[_j])
+                if _kind:
+                    _new_gd = _merge_two_coplanar_groups(
+                        group_data[_i], group_data[_j], _kind)
+                    group_data.pop(_j)
+                    group_data.pop(_i)
+                    group_data.insert(_i, _new_gd)
+                    for _w in _new_gd['walls']:
+                        wall_to_group[_w.Id.IntegerValue] = _new_gd
+                    print("  [MERGE] {} walls -> {} "
+                          "({:.2f} ft long x {:.2f} ft tall, base_z={:.2f})".format(
+                        len(_new_gd['walls']), _new_gd['label'],
+                        _new_gd['geo']['length'], _new_gd['geo']['height'],
+                        _new_gd['geo']['min_z']))
+                    _merges += 1
+                    _merged_this_pass = True
+                    _merged_i = True
+                    break
+                _j += 1
+            if not _merged_i:
+                _i += 1
+        if not _merged_this_pass:
+            break
+ 
+    return _merges
+ 
+ 
+def _diagnose_near_misses(group_data, max_report=8):
+    """When no merges happen, scan all pairs and report the ones that were
+    almost-mergeable, showing which criterion each failed. Helps decide
+    whether to loosen a tolerance or clean up the Revit model."""
+    _misses = []
+    _n = len(group_data)
+    for _i in range(_n):
+        for _j in range(_i + 1, _n):
+            gd_a = group_data[_i]
+            gd_b = group_data[_j]
+            ga = gd_a['geo']
+            gb = gd_b['geo']
+            _reasons = []
+            _score = 0.0
+ 
+            # thickness
+            try:
+                _dt = abs(gd_a['walls'][0].Width - gd_b['walls'][0].Width)
+                if _dt > _TOL_THICK:
+                    _reasons.append("thickness diff {:.4f} ft".format(_dt))
+                    _score += 1000.0  # a thickness mismatch is decisive
+            except Exception:
+                _reasons.append("could not read thickness")
+                _score += 1000.0
+ 
+            # direction axis
+            _dd = ga['direction'].DotProduct(gb['direction'])
+            if _dd < _TOL_DOT:
+                _reasons.append("direction dot {:.5f} (need >= {:.4f})"
+                                .format(_dd, _TOL_DOT))
+                _score += (1.0 - _dd) * 100
+ 
+            # normal
+            try:
+                _dn = gd_a['walls'][0].Orientation.DotProduct(
+                      gd_b['walls'][0].Orientation)
+                if _dn < _TOL_DOT:
+                    _reasons.append("normal dot {:.5f} (need >= {:.4f})"
+                                    .format(_dn, _TOL_DOT))
+                    _score += (1.0 - _dn) * 100
+            except Exception:
+                pass
+ 
+            # colinearity
+            _p1 = _perp_from_line(ga['start'], ga['direction'], gb['start'])
+            _p2 = _perp_from_line(ga['start'], ga['direction'], gb['end'])
+            _perp_max = max(_p1, _p2)
+            if _perp_max > _TOL_PERP:
+                _reasons.append("perp offset {:.4f} ft (need <= {:.3f})"
+                                .format(_perp_max, _TOL_PERP))
+                _score += _perp_max
+ 
+            # X interval gap
+            _ax_lo, _ax_hi = _x_extent(ga)
+            _bx_lo, _bx_hi = _x_extent(gb)
+            _x_gap = max(_bx_lo - _ax_hi, _ax_lo - _bx_hi, 0.0)
+            if _x_gap > _TOL_DIST:
+                _reasons.append("X gap {:.4f} ft".format(_x_gap))
+                _score += _x_gap
+ 
+            # Z interval gap
+            _az_lo, _az_hi = _z_extent(ga)
+            _bz_lo, _bz_hi = _z_extent(gb)
+            _z_gap = max(_bz_lo - _az_hi, _az_lo - _bz_hi, 0.0)
+            if _z_gap > _TOL_DIST:
+                _reasons.append("Z gap {:.4f} ft".format(_z_gap))
+                _score += _z_gap
+ 
+            # Only report pairs where every failure was small -- otherwise it's
+            # not a near-miss, it's two unrelated walls.
+            if not _reasons or _score > 3.0:
+                continue
+ 
+            _misses.append((_score, gd_a['label'], gd_b['label'], _reasons))
+ 
+    _misses.sort(key=lambda t: t[0])
+    if not _misses:
+        print("  No near-miss pairs found -- walls are truly independent.")
+        return
+    print("  {} near-miss pair(s) that ALMOST merged. Top {}:".format(
+        len(_misses), min(len(_misses), max_report)))
+    for _score, _la, _lb, _reasons in _misses[:max_report]:
+        print("    {} <-> {}".format(_la, _lb))
+        for _r in _reasons:
+            print("      - {}".format(_r))
+ 
+ 
+_pre_merge_count = len(_group_data)
+print("\nMerging coplanar aligned walls into continuous facades...")
+_merge_count = _merge_coplanar_runs(_group_data, _wall_to_group)
+_post_merge_count = len(_group_data)
+if _post_merge_count < _pre_merge_count:
+    print("  Collapsed {} walls into {} facade group(s) ({} merge(s) applied).".format(
+        _pre_merge_count, _post_merge_count, _merge_count))
+else:
+    print("  No coplanar runs collapsed.")
+    _diagnose_near_misses(_group_data)
+
 # ========== EXPORT WALLS CSV ==========
 print("\nExporting walls to CSV...")
 
@@ -303,11 +615,16 @@ try:
                 wall        = _gd['walls'][0]
 
                 # ---- Corner extension logic for individual walls ----
-                def _corner_ext(endpoint, wall_dir, excl_id):
+                # Exclude EVERY wall that's part of this merged group, not just
+                # combined_id -- a merged facade may include several Revit walls
+                # whose internal seam endpoints must not be mistaken for a
+                # perpendicular butt-joint neighbor.
+                _excl_ids = set(w.Id.IntegerValue for w in _gd['walls'])
+                def _corner_ext(endpoint, wall_dir, excl_ids):
                     _tol = 0.15
                     _ext = 0.0
                     for _aw in _all_doc_walls:
-                        if _aw.Id.IntegerValue == excl_id: continue
+                        if _aw.Id.IntegerValue in excl_ids: continue
                         try: _alc = _aw.Location.Curve
                         except: continue
                         for _k in [0, 1]:
@@ -319,8 +636,8 @@ try:
                                     _ext = max(_ext, _aw.WallType.Width / 2.0)
                     return _ext
 
-                _s_ext = _corner_ext(geo['start'], geo['direction'], combined_id)
-                _e_ext = _corner_ext(geo['end'],   geo['direction'], combined_id)
+                _s_ext = _corner_ext(geo['start'], geo['direction'], _excl_ids)
+                _e_ext = _corner_ext(geo['end'],   geo['direction'], _excl_ids)
 
                 _panel_start_ext_in = _s_ext * 12
                 _panel_end_ext_in   = _e_ext * 12
@@ -504,6 +821,7 @@ try:
                     host_wall_type = (getattr(doc.GetElement(_cwall_elem.GetTypeId()), "Name", "") if _cwall_elem else "")
 
                     # ---- Curtain Wall / Storefront ----
+                    # ---- Curtain Wall / Storefront ----
                     if isinstance(opening, Wall):
                         _cw_type      = doc.GetElement(opening.GetTypeId())
                         _cw_type_name = getattr(_cw_type, "Name", "") or ""
@@ -515,17 +833,29 @@ try:
                         _left_ft  = min(_d0, _d1)
                         _right_ft = max(_d0, _d1)
                         _w_ft = _lc.Length
+                        
+                        # --- THE STOREFRONT FIX: PHYSICAL HEIGHT OVERRIDE ---
                         _h_ft = 0.0
-                        for _hbip in [BuiltInParameter.WALL_USER_HEIGHT_PARAM, BuiltInParameter.WALL_ATTR_HEIGHT_PARAM]:
-                            try:
-                                _hp = opening.get_Parameter(_hbip)
-                                if _hp:
-                                    _hv = _hp.AsDouble()
-                                    if _hv and _hv > 0:
-                                        _h_ft = _hv
+                        try:
+                            # 1. Trust the physical 3D Bounding Box (fixes level-constrained height=0 bug)
+                            bb = opening.get_BoundingBox(None)
+                            if bb:
+                                _h_ft = bb.Max.Z - bb.Min.Z
+                        except: pass
+                        
+                        if _h_ft <= 0.0:
+                            # 2. Fallback to parameters if BB fails
+                            for _hbip in [BuiltInParameter.WALL_USER_HEIGHT_PARAM, BuiltInParameter.WALL_ATTR_HEIGHT_PARAM]:
+                                try:
+                                    _hp = opening.get_Parameter(_hbip)
+                                    if _hp and _hp.AsDouble() > 0:
+                                        _h_ft = _hp.AsDouble()
                                         break
-                            except: pass
-                        if _w_ft <= 0 or _h_ft <= 0: continue
+                                except: pass
+                                
+                        if _w_ft <= 0 or _h_ft <= 0: 
+                            print("  [WARN] Skipping Storefront {} due to 0 width/height".format(opening_id))
+                            continue
                         
                         _base_off = 0.0
                         try:
@@ -542,6 +872,7 @@ try:
                         _lvl     = level_name(opening)
                         _mark    = get_param_val(opening, "Mark",     as_string=True)
                         _comments = get_param_val(opening, "Comments", as_string=True)
+                        
                         csv_writer.writerow([
                             opening_id, "Storefront/Curtain", "Storefront/Curtain",
                             _cw_type_name, "Curtain Wall",
@@ -553,15 +884,32 @@ try:
                         ])
                         continue
 
+
                     # ---- Standard Doors / Windows ----
                     category          = opening.Category.Name if opening.Category else ""
                     opening_type_elem = doc.GetElement(opening.GetTypeId())
                     type_name         = getattr(opening_type_elem, "Name", "") or ""
                     family_name       = (getattr(opening_type_elem, "FamilyName", "") if hasattr(opening_type_elem, "FamilyName") else "")
-                    loc_pt = opening.Location.Point if hasattr(opening.Location, "Point") else XYZ(0,0,0)
                     
+                    # --- THE CUTOUT FIX: MISSING LOCATION FALLBACK ---
+                    loc_pt = None
+                    if hasattr(opening.Location, "Point") and opening.Location.Point:
+                        loc_pt = opening.Location.Point
+                    else:
+                        # Curtain Wall Doors masquerading as standard doors have no Point.
+                        # Extract their true location from the BoundingBox center.
+                        try:
+                            bb = opening.get_BoundingBox(None)
+                            if bb:
+                                loc_pt = XYZ((bb.Min.X + bb.Max.X)/2.0, (bb.Min.Y + bb.Max.Y)/2.0, bb.Min.Z)
+                        except: pass
+                        
+                    if not loc_pt:
+                        loc_pt = geo['start'] # Absolute worst-case fallback
+                        
                     # Because geo['start'] is now the specific wall's start, this math is perfectly local
                     dist_along = (loc_pt - geo['start']).DotProduct(geo['direction'])
+
 
                     def _get_dim(elem, bips, names):
                         sources = [elem]
