@@ -6,7 +6,7 @@ Openings (doors, windows, storefronts) are mapped to their specific host wall.
 """
 from Autodesk.Revit.DB import (
     FilteredElementCollector, Wall, BuiltInParameter, LocationPoint, XYZ,
-    Level, BuiltInCategory, ElementId, ElementClassFilter
+    Level, BuiltInCategory, ElementId, ElementClassFilter, Opening
 )
 from pyrevit import revit, forms
 import csv
@@ -109,11 +109,12 @@ def level_name(elem):
             or get_param_val(elem, "Level", as_string=True)
             or "")
 
+
+    
 def get_single_wall_geometry(wall):
     """
     Compute the true visual-left -> visual-right extent of a single wall.
-    AUTO-CORRECTS ghost geometry caused by Revit wall joins by trimming 
-    the analytical line to the physical Bounding Box.
+    Restored to use the pure Analytical Line to prevent projection gaps.
     """
     if not wall: return None
 
@@ -128,46 +129,26 @@ def get_single_wall_geometry(wall):
     except Exception:
         visual_right_dir = XYZ(1, 0, 0)
 
-    # Calculate absolute X/Y span based on analytical curve
     all_pts = [p0, p1]
     start_pt = min(all_pts, key=lambda p: p.DotProduct(visual_right_dir))
     end_pt   = max(all_pts, key=lambda p: p.DotProduct(visual_right_dir))
     vec = (end_pt - start_pt).Normalize()
     
-    # --- THE CLASH FIX: PHYSICAL CROP ---
+    # Safely get Z limits without modifying the X/Y physical span
     try:
         bb = wall.get_BoundingBox(None)
         if bb:
             min_z = bb.Min.Z
             max_z = bb.Max.Z
-            
-            # Project all 4 corners of the bounding box onto the wall vector
-            # to find the TRUE physical start and end points
-            bb_pts = [
-                XYZ(bb.Min.X, bb.Min.Y, 0), XYZ(bb.Max.X, bb.Min.Y, 0),
-                XYZ(bb.Min.X, bb.Max.Y, 0), XYZ(bb.Max.X, bb.Max.Y, 0)
-            ]
-            projections = [(p - start_pt).DotProduct(vec) for p in bb_pts]
-            p_min = min(projections)
-            p_max = max(projections)
-            
-            # Trim the analytical points to the physical limits
-            # This deletes the "ghost overlap" created by Revit's join engine
-            actual_start_pt = start_pt + (vec * p_min)
-            actual_end_pt   = start_pt + (vec * p_max)
-            
-            start_pt = actual_start_pt
-            end_pt   = actual_end_pt
-            analytical_length = p_max - p_min
         else:
             min_z = min(p.Z for p in all_pts)
             h = wall.get_Parameter(BuiltInParameter.WALL_USER_HEIGHT_PARAM).AsDouble()
             max_z = min_z + (h if h else 10.0)
-            analytical_length = lc.Length
     except Exception:
         min_z = min(p.Z for p in all_pts)
         max_z = min_z
-        analytical_length = lc.Length
+
+    analytical_length = lc.Length
 
     # Re-map the start and end points to the true absolute Z plane
     start_pt = XYZ(start_pt.X, start_pt.Y, min_z)
@@ -191,6 +172,17 @@ def _normalize_xy(v):
 def find_group_for_opening(opening, group_data, wall_to_group):
     """
     Return the group-dict that an opening (door/window/curtain wall) belongs to.
+
+    Priority order:
+      1. opening.Host is in wall_to_group           (exact hosted match)
+      2. HOST_ID_PARAM is in wall_to_group          (Stacked/curtain fallback)
+      3. opening's own id is in wall_to_group       (self-hosted curtain wall)
+      4. Geometric search: prefer walls whose SEGMENT actually contains the
+         opening's projection; break ties by perpendicular distance. Two
+         colinear walls used to both score perp=0 and whichever was first
+         in group_data won -- a wrong pick sent the opening's dist_along
+         projection onto a different wall's frame, and the cutout never
+         intersected the correct panel.
     """
     try:
         host = opening.Host
@@ -208,25 +200,79 @@ def find_group_for_opening(opening, group_data, wall_to_group):
         g = wall_to_group.get(opening.Id.IntegerValue)
         if g is not None: return g
     except Exception: pass
+
+    # --- Geometric fallback ---
     try:
         if isinstance(opening, Wall):
             lc = opening.Location.Curve
             pt = lc.Evaluate(0.5, True)
+        elif isinstance(opening, Opening):
+            # Native wall openings don't have Location.Point; derive a
+            # midpoint from BoundaryRect corners.
+            try:
+                _rect = list(opening.BoundaryRect)
+                _p0, _p1 = _rect[0], _rect[1]
+                pt = XYZ((_p0.X + _p1.X) / 2.0,
+                         (_p0.Y + _p1.Y) / 2.0,
+                         (_p0.Z + _p1.Z) / 2.0)
+            except Exception:
+                pt = opening.Location.Point  # last-resort; will raise if unset
         else:
             pt = opening.Location.Point
-        best = group_data[0]
-        best_d = float('inf')
+
+        _op_label = "{} (id={})".format(
+            opening.Category.Name if opening.Category else type(opening).__name__,
+            opening.Id.IntegerValue)
+
+        # Tiered scoring. Perpendicular distance dominates -- a coplanar wall
+        # ALWAYS beats a non-coplanar wall, even if the non-coplanar one
+        # happens to contain the projection. (The previous version was picking
+        # perp=66 ft SEG-HITs over perp=0.05 ft near-misses, which sent every
+        # curtain wall to the wrong facade.)
+        #
+        # Tier 0: coplanar AND projection lands inside the segment  (perfect)
+        # Tier 1: coplanar, projection past the endpoint             (near-hit)
+        # Tier 2: not coplanar, but projection lands in segment      (weak)
+        # Tier 3: not coplanar and out-of-segment                    (worst)
+        # Within a tier, smaller perp wins.
+        _COPLANAR_PERP_FT = 0.5   # ~6" perp to count as on the same plane
+        _tol_end          = 0.1   # ~1" forgiveness on segment ends
+
+        _candidates = []
         for gd in group_data:
             geo = gd['geo']
             vx  = pt.X - geo['start'].X
             vy  = pt.Y - geo['start'].Y
             d   = geo['direction']
-            perp = abs(vx * d.Y - vy * d.X)
-            if perp < best_d:
-                best_d = perp
-                best   = gd
-        return best
-    except Exception:
+            perp   = abs(vx * d.Y - vy * d.X)
+            along  = vx * d.X + vy * d.Y
+            in_seg = (-_tol_end <= along <= geo['length'] + _tol_end)
+            coplanar = perp < _COPLANAR_PERP_FT
+            if   coplanar and in_seg: tier = 0
+            elif coplanar:            tier = 1
+            elif in_seg:              tier = 2
+            else:                     tier = 3
+            _candidates.append((tier, perp, gd, in_seg, coplanar))
+
+        _candidates.sort(key=lambda c: (c[0], c[1]))
+        _tier, _perp, chosen, _in_seg, _coplanar = _candidates[0]
+
+        _tag = {
+            0: "SEG-HIT coplanar",
+            1: "COPLANAR past-endpoint (projection just outside segment)",
+            2: "SEG-HIT non-coplanar (perp large -- suspicious)",
+            3: "PERP-ONLY (no coplanar wall, no wall contains projection!)",
+        }[_tier]
+        print("  [FALLBACK] {} -> {}  ({}, perp={:.4f} ft)".format(
+            _op_label, chosen['label'], _tag, _perp))
+        return chosen
+    except Exception as _e:
+        try:
+            print("  [FALLBACK] opening id={} -> group_data[0] "
+                  "(exception in fallback: {})".format(
+                      opening.Id.IntegerValue, _e))
+        except Exception:
+            pass
         return group_data[0]
 
 
@@ -376,57 +422,102 @@ def _intervals_touch_or_overlap(a_lo, a_hi, b_lo, b_hi, tol):
  
 def _coplanar_mergeable(gd_a, gd_b):
     """Return 'coplanar' if the two groups can be merged, or None if not.
-    All five criteria in the header comment must pass."""
+
+    The bounding-rectangle union in _merge_two_coplanar_groups only produces
+    a physically correct wall when the two source rectangles perfectly tile
+    the bounding rectangle -- with no phantom (uncovered) area.  That
+    requires one of the axes to match exactly:
+
+        HORIZONTAL SEAM : Z ranges match (same base AND top). X touches or
+                          overlaps. Union spans the total length at the
+                          shared height. No phantom.
+
+        VERTICAL STACK  : X ranges match (same left AND right). Z touches
+                          or overlaps. Union stacks the two Z ranges over
+                          the shared footprint. No phantom.
+
+        SAME-PLACE      : both match. Duplicates / coplanar construction
+                          layers. Still merges cleanly.
+
+    Any other pattern -- adjacent walls of different heights, brick-pattern
+    offsets, stepped facades -- would create a phantom strip inside the
+    merged bounding rectangle. Panel placement would fill that strip with
+    panels even though no wall is physically there, which is exactly the
+    "panels reach the tallest part of the facade even where the wall is
+    shorter" symptom. Those pairs stay unmerged; each wall keeps its own
+    correct height and gets its own panel layout.
+    """
     if not _shared_type_checks(gd_a, gd_b):
         return None
- 
+
     ga, gb = gd_a['geo'], gd_b['geo']
- 
-    # (4) colinear in plan
+
+    # colinear in plan
     if _perp_from_line(ga['start'], ga['direction'], gb['start']) > _TOL_PERP:
         return None
     if _perp_from_line(ga['start'], ga['direction'], gb['end']) > _TOL_PERP:
         return None
- 
-    # (5) rectangle union must be connected -- both X and Z intervals
-    #     have to touch or overlap. A gap on both axes = separate facades.
+
     _ax_lo, _ax_hi = _x_extent(ga)
     _bx_lo, _bx_hi = _x_extent(gb)
-    if not _intervals_touch_or_overlap(_ax_lo, _ax_hi, _bx_lo, _bx_hi, _TOL_DIST):
-        return None
- 
     _az_lo, _az_hi = _z_extent(ga)
     _bz_lo, _bz_hi = _z_extent(gb)
-    if not _intervals_touch_or_overlap(_az_lo, _az_hi, _bz_lo, _bz_hi, _TOL_DIST):
-        return None
- 
-    return "coplanar"
+
+    _x_matches   = (abs(_ax_lo - _bx_lo) < _TOL_DIST and
+                    abs(_ax_hi - _bx_hi) < _TOL_DIST)
+    _z_matches   = (abs(_az_lo - _bz_lo) < _TOL_DIST and
+                    abs(_az_hi - _bz_hi) < _TOL_DIST)
+    _x_connects  = _intervals_touch_or_overlap(_ax_lo, _ax_hi,
+                                               _bx_lo, _bx_hi, _TOL_DIST)
+    _z_connects  = _intervals_touch_or_overlap(_az_lo, _az_hi,
+                                               _bz_lo, _bz_hi, _TOL_DIST)
+
+    # Horizontal seam: Z matches, X touches/overlaps.
+    if _z_matches and _x_connects:
+        return "coplanar"
+    # Vertical stack: X matches, Z touches/overlaps.
+    if _x_matches and _z_connects:
+        return "coplanar"
+
+    return None
  
  
 def _merge_two_coplanar_groups(gd_a, gd_b, kind):
-    """Combine two aligned groups into the bounding rectangle of their union."""
+    """Combine two aligned groups into the bounding rectangle of their union by projecting onto a perfect baseline."""
     _walls = gd_a['walls'] + gd_b['walls']
     ga, gb = gd_a['geo'], gd_b['geo']
+    
+    # 1. Adopt the first wall's geometry as the absolute truth baseline
+    _base_pt = ga['start']
     _d = ga['direction']
- 
-    # X extent: leftmost and rightmost XY endpoints along the direction axis
+    
+    # 2. Gather all 4 original endpoints
     _pts = [ga['start'], ga['end'], gb['start'], gb['end']]
-    _new_start_xy = min(_pts, key=lambda p: _proj_on_dir(p, _d))
-    _new_end_xy   = max(_pts, key=lambda p: _proj_on_dir(p, _d))
-    _new_length = ((_new_end_xy.X - _new_start_xy.X) ** 2 +
-                   (_new_end_xy.Y - _new_start_xy.Y) ** 2) ** 0.5
- 
-    # Z extent: union of both walls' Z ranges
+    
+    # 3. Mathematically project all points onto the pure baseline vector
+    # This strips out any microscopic perpendicular drift between the walls
+    _projections = [ (p.X - _base_pt.X) * _d.X + (p.Y - _base_pt.Y) * _d.Y for p in _pts ]
+    
+    _min_proj = min(_projections)
+    _max_proj = max(_projections)
+    
+    _new_length = _max_proj - _min_proj
+    
+    # 4. Construct perfectly straight new endpoints firmly on the idealized line
+    _new_start_x = _base_pt.X + _d.X * _min_proj
+    _new_start_y = _base_pt.Y + _d.Y * _min_proj
+    
+    _new_end_x = _base_pt.X + _d.X * _max_proj
+    _new_end_y = _base_pt.Y + _d.Y * _max_proj
+    
+    # Z extent remains a straightforward union
     _new_min_z = min(ga['min_z'], gb['min_z'])
-    _new_top   = max(ga['min_z'] + ga['height'],
-                     gb['min_z'] + gb['height'])
+    _new_top   = max(ga['min_z'] + ga['height'], gb['min_z'] + gb['height'])
     _new_height = _new_top - _new_min_z
- 
-    # Snap start/end Z to the new base so the geo dict follows the same
-    # convention as get_single_wall_geometry (both endpoints sit at min_z).
-    _new_start = XYZ(_new_start_xy.X, _new_start_xy.Y, _new_min_z)
-    _new_end   = XYZ(_new_end_xy.X,   _new_end_xy.Y,   _new_min_z)
- 
+    
+    _new_start = XYZ(_new_start_x, _new_start_y, _new_min_z)
+    _new_end   = XYZ(_new_end_x,   _new_end_y,   _new_min_z)
+    
     _new_geo = {
         'start':     _new_start,
         'end':       _new_end,
@@ -435,7 +526,7 @@ def _merge_two_coplanar_groups(gd_a, gd_b, kind):
         'min_z':     _new_min_z,
         'length':    _new_length,
     }
- 
+    
     _cid = min(w.Id.IntegerValue for w in _walls)
     _label = "Facade_{}".format(_cid)
     return {'walls': _walls, 'geo': _new_geo, 'id': _cid, 'label': _label}
@@ -549,6 +640,28 @@ def _diagnose_near_misses(group_data, max_report=8):
             if _z_gap > _TOL_DIST:
                 _reasons.append("Z gap {:.4f} ft".format(_z_gap))
                 _score += _z_gap
+ 
+            # Phantom-area diagnosis: rectangles overlap/touch but neither
+            # X nor Z ranges match exactly. Merging would create a step or
+            # L-shape and panel_calculator would fill the "missing" corner
+            # with phantom panels. Reject and flag for the user.
+            if _x_gap <= _TOL_DIST and _z_gap <= _TOL_DIST:
+                _x_matches = (abs(_ax_lo - _bx_lo) < _TOL_DIST and
+                              abs(_ax_hi - _bx_hi) < _TOL_DIST)
+                _z_matches = (abs(_az_lo - _bz_lo) < _TOL_DIST and
+                              abs(_az_hi - _bz_hi) < _TOL_DIST)
+                if not (_x_matches or _z_matches):
+                    _dz_base = abs(_az_lo - _bz_lo)
+                    _dz_top  = abs(_az_hi - _bz_hi)
+                    _dx_lo   = abs(_ax_lo - _bx_lo)
+                    _dx_hi   = abs(_ax_hi - _bx_hi)
+                    _reasons.append(
+                        "would create phantom area (bases differ by {:.2f} ft, "
+                        "tops by {:.2f} ft; left ends by {:.2f} ft, right ends "
+                        "by {:.2f} ft) -- either Z or X range must match "
+                        "exactly to merge".format(
+                            _dz_base, _dz_top, _dx_lo, _dx_hi))
+                    _score += min(_dz_base + _dz_top, _dx_lo + _dx_hi)
  
             # Only report pairs where every failure was small -- otherwise it's
             # not a near-miss, it's two unrelated walls.
@@ -756,6 +869,26 @@ doors   = [d for d in FilteredElementCollector(doc).OfCategory(BuiltInCategory.O
 windows = [w for w in FilteredElementCollector(doc).OfCategory(BuiltInCategory.OST_Windows)
            .WhereElementIsNotElementType() if _hosted_on_facade(w)]
 
+# Native "Wall Opening" elements (Architecture > Opening > Wall). These are
+# rectangular cutouts placed directly in a wall -- not a door or window family,
+# just a hole. Category OST_SWallRectOpening, class Opening. They need to be
+# panelized like any other opening.
+wall_openings = []
+try:
+    _all_openings = list(FilteredElementCollector(doc).OfClass(Opening))
+    for _o in _all_openings:
+        try:
+            _host = _o.Host
+            if _host is None: continue
+            if _host.Id.IntegerValue not in facade_wall_ids: continue
+            # Skip non-rectangular openings (e.g., arc-wall or shaft openings).
+            # We only handle straight-wall rectangular cutouts.
+            if not getattr(_o, "IsRectBoundary", False): continue
+            wall_openings.append(_o)
+        except Exception: pass
+except Exception as _e:
+    print("  Wall opening collection failed: {}".format(_e))
+
 _seen_cw_ids = set()
 curtain_walls_hosted = []
 
@@ -767,32 +900,138 @@ for _sw in selected_walls:
             _seen_cw_ids.add(_sw.Id.IntegerValue)
     except Exception: pass
 
-# Scenario B: curtain walls embedded inside a selected basic wall
+# ---- AUTHORITATIVE PARENT MAP ----
+# Before doing anything else, ask every selected basic wall which curtain
+# walls it hosts. Revit exposes two APIs for this and they don't always
+# agree in real projects:
+#   * FindInserts(includeShadows=false, includeEmbeddedWalls=true, ...)
+#     is the intended API for embedded curtain walls and is usually the
+#     reliable one.
+#   * GetDependentElements(ElementClassFilter(Wall)) works as a fallback
+#     for models where FindInserts comes back empty.
+# We try both and merge the results. This is the source of truth for
+# routing openings back to their real host: it handles Scenario A (user
+# selected the curtain walls) AND Scenario B (user only selected the
+# basic walls) with the same code path, and it protects against the
+# geometric fallback's habit of picking a colinear-but-wrong wall when
+# several walls are in the selection.
 _wall_class_filter = ElementClassFilter(Wall)
+_curtain_to_parent = {}  # cw_id -> parent basic_wall element
+_findinserts_hits = 0
+_getdep_hits = 0
 for _bwall in basic_walls:
+    # (1) FindInserts -- explicitly returns embedded curtain walls
+    try:
+        _inserts = _bwall.FindInserts(False, True, True, False)
+        for _dep_id in _inserts:
+            _dep = doc.GetElement(_dep_id)
+            if not (_dep and isinstance(_dep, Wall)): continue
+            try:
+                if str(_dep.WallType.Kind).lower() == "curtain":
+                    if _dep_id.IntegerValue not in _curtain_to_parent:
+                        _curtain_to_parent[_dep_id.IntegerValue] = _bwall
+                        _findinserts_hits += 1
+            except Exception: pass
+    except Exception: pass
+    # (2) GetDependentElements -- backup for models where FindInserts is empty
     try:
         for _dep_id in _bwall.GetDependentElements(_wall_class_filter):
-            if _dep_id.IntegerValue in _seen_cw_ids: continue
             _dep = doc.GetElement(_dep_id)
-            if isinstance(_dep, Wall):
-                try:
-                    if str(_dep.WallType.Kind).lower() == "curtain":
-                        curtain_walls_hosted.append(_dep)
-                        _seen_cw_ids.add(_dep_id.IntegerValue)
-                        # Map this curtain wall directly to its parent basic wall ID
-                        _wall_to_group[_dep_id.IntegerValue] = _wall_to_group[_bwall.Id.IntegerValue]
-                except Exception: pass
+            if not (_dep and isinstance(_dep, Wall)): continue
+            try:
+                if str(_dep.WallType.Kind).lower() == "curtain":
+                    if _dep_id.IntegerValue not in _curtain_to_parent:
+                        _curtain_to_parent[_dep_id.IntegerValue] = _bwall
+                        _getdep_hits += 1
+            except Exception: pass
     except Exception: pass
 
-# Final fallback for unbound curtain walls
-for _cw in curtain_walls_hosted:
-    if _cw.Id.IntegerValue not in _wall_to_group:
-        _gd_match = find_group_for_opening(_cw, _group_data, _wall_to_group)
-        _wall_to_group[_cw.Id.IntegerValue] = _gd_match
+print("  Authoritative parent map: {} curtain wall(s) found "
+      "({} via FindInserts, {} via GetDependentElements)".format(
+          len(_curtain_to_parent), _findinserts_hits, _getdep_hits))
 
-all_openings_list = list(doors) + list(windows) + curtain_walls_hosted
-print("  Doors: {} | Windows: {} | Curtain/Storefronts: {}".format(
-    len(doors), len(windows), len(curtain_walls_hosted)))
+# Pull in any curtain walls found as dependents that weren't user-selected.
+for _cw_id, _bwall in _curtain_to_parent.items():
+    if _cw_id in _seen_cw_ids: continue
+    _dep = doc.GetElement(ElementId(_cw_id))
+    if _dep is not None:
+        curtain_walls_hosted.append(_dep)
+        _seen_cw_ids.add(_cw_id)
+
+# ---- ROUTE EVERY CURTAIN WALL TO A GROUP ----
+# Priority order:
+#   1. Authoritative parent (in _curtain_to_parent)  <- fixes the batch bug
+#   2. Geometric fallback via find_group_for_opening
+# Curtain walls that end up in the fallback with a very large perpendicular
+# offset almost certainly don't belong to any of the exported basic walls;
+# they get dropped rather than misassigned, with a warning so the user knows
+# to check their selection.
+_ORPHAN_PERP_LIMIT_FT = 1.0  # >1 ft perpendicular = definitely not embedded in
+                             # this wall; typical embedded curtain wall sits
+                             # within an inch of the basic wall's centerline.
+_routed_via_parent = 0
+_routed_via_geometry = 0
+_dropped_orphans = []
+_kept_curtain_walls = []
+for _cw in curtain_walls_hosted:
+    _cw_id = _cw.Id.IntegerValue
+    if _cw_id in _wall_to_group:
+        _kept_curtain_walls.append(_cw)
+        continue
+
+    _parent = _curtain_to_parent.get(_cw_id)
+    if _parent is not None:
+        _parent_id = _parent.Id.IntegerValue
+        if _parent_id in _wall_to_group:
+            _wall_to_group[_cw_id] = _wall_to_group[_parent_id]
+            _routed_via_parent += 1
+            _kept_curtain_walls.append(_cw)
+            continue
+
+    # Geometric fallback -- but check the perpendicular distance and drop
+    # curtain walls that clearly don't sit on any exported basic wall.
+    # An embedded curtain wall is coplanar with its host (perp within a few
+    # inches; wall thickness at most). Anything with perp > ~1 ft everywhere
+    # is on a different wall that isn't in the selection.
+    try:
+        _cw_lc = _cw.Location.Curve
+        _cw_pt = _cw_lc.Evaluate(0.5, True)
+        _best_perp = float('inf')
+        for _gd in _group_data:
+            _geo = _gd['geo']
+            _vx = _cw_pt.X - _geo['start'].X
+            _vy = _cw_pt.Y - _geo['start'].Y
+            _d = _geo['direction']
+            _p = abs(_vx * _d.Y - _vy * _d.X)
+            if _p < _best_perp: _best_perp = _p
+        if _best_perp > _ORPHAN_PERP_LIMIT_FT:
+            _dropped_orphans.append((_cw_id, _best_perp))
+            continue  # skip this curtain wall entirely
+    except Exception:
+        pass
+
+    _gd_match = find_group_for_opening(_cw, _group_data, _wall_to_group)
+    _wall_to_group[_cw_id] = _gd_match
+    _routed_via_geometry += 1
+    _kept_curtain_walls.append(_cw)
+
+curtain_walls_hosted = _kept_curtain_walls
+print("  Curtain wall routing: {} via authoritative host, {} via geometric fallback"
+      .format(_routed_via_parent, _routed_via_geometry))
+if _dropped_orphans:
+    print("  [WARN] Dropped {} curtain wall(s) that don't sit on any exported basic wall "
+          "(perpendicular offset > {:.1f} ft):".format(
+              len(_dropped_orphans), _ORPHAN_PERP_LIMIT_FT))
+    for _id, _p in _dropped_orphans[:15]:
+        print("           id={}  perp={:.2f} ft".format(_id, _p))
+    if len(_dropped_orphans) > 15:
+        print("           ... {} more".format(len(_dropped_orphans) - 15))
+    print("           If these should have been exported, add their host basic "
+          "walls to the selection.")
+
+all_openings_list = list(doors) + list(windows) + curtain_walls_hosted + list(wall_openings)
+print("  Doors: {} | Windows: {} | Curtain/Storefronts: {} | Wall Openings: {}".format(
+    len(doors), len(windows), len(curtain_walls_hosted), len(wall_openings)))
 print("  Total openings detected: {}".format(len(all_openings_list)))
 
 # ========== EXPORT OPENINGS CSV ==========
@@ -814,11 +1053,30 @@ try:
             for opening in all_openings_list:
                 try:
                     opening_id = opening.Id.IntegerValue
+                    # Show host chain so we know whether the assignment came from
+                    # opening.Host, HOST_ID_PARAM, self-id, or the geometric
+                    # fallback. If two of these disagree, the export is picking a
+                    # wall the opening isn't actually on.
+                    _host_ids = []
+                    try:
+                        _h = opening.Host
+                        _host_ids.append(("Host", _h.Id.IntegerValue if _h else None))
+                    except Exception: _host_ids.append(("Host", "exc"))
+                    try:
+                        _hp = opening.get_Parameter(BuiltInParameter.HOST_ID_PARAM)
+                        _host_ids.append(("HOST_ID_PARAM",
+                                          _hp.AsElementId().IntegerValue if _hp else None))
+                    except Exception: _host_ids.append(("HOST_ID_PARAM", "exc"))
+
                     _gd          = find_group_for_opening(opening, _group_data, _wall_to_group)
                     geo          = _gd['geo']
                     combined_id  = _gd['id']
                     _cwall_elem  = doc.GetElement(ElementId(combined_id))
                     host_wall_type = (getattr(doc.GetElement(_cwall_elem.GetTypeId()), "Name", "") if _cwall_elem else "")
+
+                    _cat = opening.Category.Name if opening.Category else "?"
+                    print("  [OPENING] {} id={} host_chain={} -> {} (combined_id={})".format(
+                        _cat, opening_id, _host_ids, _gd['label'], combined_id))
 
                     # ---- Curtain Wall / Storefront ----
                     # ---- Curtain Wall / Storefront ----
@@ -880,6 +1138,66 @@ try:
                             rnum(_w_ft), rnum(_h_ft), rnum(_thk_ft),
                             rnum(_center), rnum(_left_ft), rnum(_right_ft),
                             xyz_str(_loc_pt), "", "",
+                            "", "", _mark, _comments, rnum(_w_ft * _h_ft)
+                        ])
+                        continue
+
+
+                    # ---- Wall Opening (native rectangular cutout) ----
+                    # These are Autodesk.Revit.DB.Opening instances with
+                    # IsRectBoundary = True. They don't carry Location.Point,
+                    # dimension parameters, or family/type names -- just a
+                    # BoundaryRect of two opposite corners in world XYZ.
+                    if isinstance(opening, Opening):
+                        try:
+                            _rect_pts = list(opening.BoundaryRect)
+                        except Exception:
+                            print("  [WARN] Skipping Wall Opening {}: no BoundaryRect"
+                                  .format(opening_id))
+                            continue
+                        if not _rect_pts or len(_rect_pts) < 2:
+                            print("  [WARN] Skipping Wall Opening {}: BoundaryRect < 2 pts"
+                                  .format(opening_id))
+                            continue
+
+                        _pa, _pb = _rect_pts[0], _rect_pts[1]
+                        _z_lo = min(_pa.Z, _pb.Z)
+                        _z_hi = max(_pa.Z, _pb.Z)
+                        _h_ft = _z_hi - _z_lo
+
+                        # Project both corners onto the merged facade direction to
+                        # get along-wall extent. In-plane the two corners share the
+                        # same XY position projected onto direction axis and differ
+                        # only in Z, but numerically both projections are computed
+                        # and the extremes taken so this stays robust to whichever
+                        # order BoundaryRect returns.
+                        _d0 = (_pa - geo['start']).DotProduct(geo['direction'])
+                        _d1 = (_pb - geo['start']).DotProduct(geo['direction'])
+                        _left_ft  = min(_d0, _d1)
+                        _right_ft = max(_d0, _d1)
+                        _w_ft = _right_ft - _left_ft
+
+                        if _w_ft <= 0 or _h_ft <= 0:
+                            print("  [WARN] Skipping Wall Opening {}: zero width/height "
+                                  "(w={:.3f}, h={:.3f})".format(opening_id, _w_ft, _h_ft))
+                            continue
+
+                        _sill_ft = _z_lo - geo['min_z']
+                        _center  = (_left_ft + _right_ft) / 2.0
+                        _mid_xy  = XYZ((_pa.X + _pb.X) / 2.0,
+                                       (_pa.Y + _pb.Y) / 2.0, _z_lo)
+                        _thk_ft  = 0.0  # native openings have no wall-fill thickness
+                        _lvl     = level_name(opening)
+                        _mark    = get_param_val(opening, "Mark",     as_string=True)
+                        _comments = get_param_val(opening, "Comments", as_string=True)
+
+                        csv_writer.writerow([
+                            opening_id, "Wall Opening", "Wall Opening",
+                            "Rectangular Wall Opening", "Native",
+                            combined_id, host_wall_type, _lvl, rnum(_sill_ft),
+                            rnum(_w_ft), rnum(_h_ft), rnum(_thk_ft),
+                            rnum(_center), rnum(_left_ft), rnum(_right_ft),
+                            xyz_str(_mid_xy), "", "",
                             "", "", _mark, _comments, rnum(_w_ft * _h_ft)
                         ])
                         continue

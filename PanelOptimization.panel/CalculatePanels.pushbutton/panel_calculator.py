@@ -782,6 +782,13 @@ def fill_horizontal_courses(x0, x1, y0, y1, panels, panel_counter,
     minh = constraints.min_height
     SHORT = constraints.short_max
     LONG = constraints.long_max
+    # A configured max_width acts as an additional hard cap. If the user set
+    # max_width = 138 in the config, panel widths must respect 138 even when
+    # the "long-short" panel rule would allow up to LONG (348). Without this
+    # cap, short-height fill panels ran up to 348" wide even though the
+    # config said 138".
+    _cap_w = float(getattr(constraints, "max_width", LONG) or LONG)
+    LONG_CAPPED = min(LONG, _cap_w)
     sp = float(getattr(constraints, "panel_spacing", 0.0) or 0.0)
 
     W = x1 - x0
@@ -803,11 +810,11 @@ def fill_horizontal_courses(x0, x1, y0, y1, panels, panel_counter,
             rem = x1 - x
             if rem < minw:
                 row = [p for p in panels if abs(p.y - y) < 0.01 and p.x >= x0]
-                if row and (row[-1].w + sp + rem) <= LONG:
+                if row and (row[-1].w + sp + rem) <= LONG_CAPPED:
                     row[-1].w = round(row[-1].w + sp + rem, 6)
                     row[-1].cutouts = calculate_panel_cutouts(row[-1], all_openings)
                 break
-            pw = rem if rem <= LONG else LONG
+            pw = rem if rem <= LONG_CAPPED else LONG_CAPPED
             if 0 < (rem - pw) < (minw + sp):
                 pw = rem - (minw + sp)
             cand = Panel(round(x, 6), round(y, 6), round(pw, 6), round(course_h, 6),
@@ -828,6 +835,14 @@ def fill_vertical_gap(region_x_start, region_x_end, gap_y_start, gap_y_end,
     PANEL_HEIGHT_MIN = constraints.min_height
     SHORT_MAX = constraints.short_max
     LONG_MAX = constraints.long_max
+    # A configured max_width acts as an absolute hard cap. If the user set
+    # max_width = 138 in the config, panel widths must respect 138 even
+    # when the "short panels can be wide" rule would allow up to LONG_MAX
+    # (348). Without this cap, the fill above a wide storefront could drop
+    # a single 143"-wide panel across the whole spandrel even though the
+    # config said 138" max.
+    _CAP_W = float(getattr(constraints, "max_width", LONG_MAX) or LONG_MAX)
+    LONG_CAPPED = min(LONG_MAX, _CAP_W)
     DIMENSION_INCREMENT = constraints.dimension_increment
     spacing = float(getattr(constraints, "panel_spacing", 0.0) or 0.0)
 
@@ -852,7 +867,7 @@ def fill_vertical_gap(region_x_start, region_x_end, gap_y_start, gap_y_end,
         panel_h = snap_down(remaining_height, DIMENSION_INCREMENT)
         if panel_h < PANEL_HEIGHT_MIN: break
 
-        max_width = SHORT_MAX if panel_h > SHORT_MAX else LONG_MAX
+        max_width = SHORT_MAX if panel_h > SHORT_MAX else LONG_CAPPED
         x_cursor = panel_x_start
         row_placed = False
 
@@ -866,7 +881,7 @@ def fill_vertical_gap(region_x_start, region_x_end, gap_y_start, gap_y_end,
                 if row_panels:
                     last = row_panels[-1]
                     extended_w = round(last.w + spacing + remaining_width, 8)
-                    max_w_here = SHORT_MAX if panel_h > SHORT_MAX else LONG_MAX
+                    max_w_here = SHORT_MAX if panel_h > SHORT_MAX else LONG_CAPPED
                     if extended_w <= max_w_here:
                         last.w = extended_w
                         last.cutouts = calculate_panel_cutouts(last, all_openings)
@@ -1380,40 +1395,50 @@ def calculate_panel_cutouts(panel, openings):
     cutouts = []
     
     for opening in openings:
-        # If it's a massive wall-splitter blocker (like a 30ft storefront), skip it
         if getattr(opening, 'force_blocker', False) and opening.w > 100.0:
             continue
 
-        # Calculate raw boundaries including clearances
         hole_left = opening.x - getattr(opening.clearances, 'rough_jamb', 0.0)
         hole_right = opening.x + opening.w + getattr(opening.clearances, 'rough_jamb', 0.0)
         hole_bottom = opening.y - getattr(opening.clearances, 'rough_sill', 0.0)
         hole_top = opening.y + opening.h + getattr(opening.clearances, 'rough_header', 0.0)
 
-        # Calculate physical intersection
         inter_left = max(panel.x, hole_left)
         inter_right = min(panel.x + panel.w, hole_right)
         inter_bottom = max(panel.y, hole_bottom)
         inter_top = min(panel.y + panel.h, hole_top)
 
-        # If they physically overlap, CUT IT. No name checking.
         if inter_right > inter_left + 0.01 and inter_top > inter_bottom + 0.01:
-            cutout_info = {
-                "id":            opening.id,
-                "type":          getattr(opening, 'type', 'Opening'),
-                "x_in":          float(inter_left - panel.x),
-                "y_in":          float(inter_bottom - panel.y),
-                "width_in":      float(inter_right - inter_left),
-                "height_in":     float(inter_top - inter_bottom),
-                "raw_x_in":      float(opening.x - panel.x),
-                "raw_y_in":      float(max(0.0, opening.y - panel.y)),
-                "raw_width_in":  float(opening.w),
-                "raw_height_in": float(opening.h),
-                "rough_jamb":    float(getattr(opening.clearances, 'rough_jamb', 0.0)),
-            }
-            cutouts.append(cutout_info)
+            raw_x = float(opening.x - panel.x)
+            raw_y = float(max(0.0, opening.y - panel.y))
+            
+            # --- FIX: THE LAYERED GEOMETRY DEDUPLICATOR ---
+            # Prevent nested Revit geometry from spawning 6 cutouts in the same spot
+            is_dup = False
+            for c in cutouts:
+                if (abs(c["raw_x_in"] - raw_x) < 2.0 and 
+                    abs(c["raw_y_in"] - raw_y) < 2.0 and 
+                    abs(c["raw_width_in"] - float(opening.w)) < 2.0 and 
+                    abs(c["raw_height_in"] - float(opening.h)) < 2.0):
+                    is_dup = True
+                    break
+                    
+            if not is_dup:
+                cutout_info = {
+                    "id":            opening.id,
+                    "type":          getattr(opening, 'type', 'Opening'),
+                    "x_in":          float(inter_left - panel.x),
+                    "y_in":          float(inter_bottom - panel.y),
+                    "width_in":      float(inter_right - inter_left),
+                    "height_in":     float(inter_top - inter_bottom),
+                    "raw_x_in":      raw_x,
+                    "raw_y_in":      raw_y,
+                    "raw_width_in":  float(opening.w),
+                    "raw_height_in": float(opening.h),
+                    "rough_jamb":    float(getattr(opening.clearances, 'rough_jamb', 0.0)),
+                }
+                cutouts.append(cutout_info)
 
-    # Sort: Void 1 = highest on panel, ties broken left-to-right
     cutouts.sort(key=lambda c: (-c["y_in"], c["x_in"]))
     return cutouts
 
@@ -1575,9 +1600,13 @@ def detect_repeating_opening_groups(openings, constraints):
                           len(run), round(key[0], 3), round(key[1], 3),
                           round(run[0].y, 1), ref_spacing) + Ansi.RESET)
                 
-                # Advance past this run. If the pattern broke, 'j' is the window 
-                # that caused the break. We start the next grid check from 'j'.
-                i = j
+                # Advance PAST this run. band_sorted[j] is already consumed as
+                # the run's last member -- restarting at j (old behavior) reused
+                # that same window as the first element of the next candidate
+                # run, fabricating a bogus 2-window "group" out of the boundary
+                # (e.g. last window of cluster A + first window of cluster B),
+                # which corrupted zone-merging and mirror/identical detection.
+                i = j + 1
 
     return repeating
 
@@ -1965,21 +1994,25 @@ def _place_minimize_unique(wall_width, wall_height, openings, constraints,
 
     def _zone_of(grp): return grp[0].left_clearance_zone, grp[-1].right_clearance_zone
 
+    # --- THE FIX: DOMINANT GRID ELIMINATOR ---
+    # 1. Sort groups by longest physical span so the largest, most dominant pattern wins.
+    repeating_groups.sort(key=lambda g: _zone_of(g)[1] - _zone_of(g)[0], reverse=True)
+    
     merged_groups = []
     for group in repeating_groups:
         zs, ze = _zone_of(group)
-        merged = None
+        clash = False
+        
         for m in merged_groups:
+            # 2. Check if this pattern physically overlaps an already-approved dominant pattern
             overlap = min(ze, m[1]) - max(zs, m[0])
-            smaller = min(ze - zs, m[1] - m[0])
-            if overlap > 0.8 * smaller:
-                merged = m
+            if overlap > 1.0: # If they overlap by more than 1 inch
+                clash = True
                 break
-        if merged is not None:
-            merged[2].extend(group)
-            merged[0] = min(merged[0], zs)
-            merged[1] = max(merged[1], ze)
-        else:
+                
+        # 3. If there is NO clash, we keep the pattern pure and unpolluted.
+        # If there IS a clash, we discard this inferior pattern entirely.
+        if not clash:
             merged_groups.append([zs, ze, list(group)])
 
     # 3. Process each merged zone (MULTI-WINDOW WITH ASYMMETRICAL ANCHOR EXPANSION)
@@ -2065,6 +2098,7 @@ def _place_minimize_unique(wall_width, wall_height, openings, constraints,
                 canonical_left = exp_L
 
             # --- MULTI-WINDOW TILING ---
+
             else:
                 best_N = 1
                 for N in range(1, 3): 
@@ -2075,8 +2109,19 @@ def _place_minimize_unique(wall_width, wall_height, openings, constraints,
                         break 
                 
                 standard_w = (best_N * window_spacing) - constraints.panel_spacing
-                group_w = ((best_N - 1) * window_spacing) + primary_o.w
-                canonical_left = (standard_w - group_w) / 2.0
+                
+                # --- THE STRICT LIMIT ENFORCER ---
+                # If the window spacing itself exceeds the physical board limit, 
+                # we must divide the span into mathematically equal sub-panels.
+                if standard_w > max_w_allowed:
+                    divs = math.ceil(window_spacing / (max_w_allowed + constraints.panel_spacing))
+                    standard_w = (window_spacing / divs) - constraints.panel_spacing
+                    # Center the window within the divided group
+                    group_w = primary_o.w
+                    canonical_left = (standard_w - group_w) / 2.0
+                else:
+                    group_w = ((best_N - 1) * window_spacing) + primary_o.w
+                    canonical_left = (standard_w - group_w) / 2.0
 
             if standard_w is not None:
                 memory_bank[local_windows] = (standard_w, canonical_left)
@@ -2192,63 +2237,318 @@ def _place_minimize_unique(wall_width, wall_height, openings, constraints,
         for o in u_openings: o.x += u_start
 
     # --- THE SEAM WELDER (Solid Panel Combiner) ---
+    #
+    # Two things this step needs to get right that the previous version got
+    # wrong:
+    #   1. When an opening straddles a panel joint, each side carries a
+    #      "half cutout" for that opening. The old cutout-count check saw
+    #      the raw sum (e.g. 2 halves on left + 2 halves on right = 4) and
+    #      refused to weld, so straddling stayed forever. What matters is
+    #      the count AFTER coalescing back into whole cutouts.
+    #   2. After welding, the two halves of the straddling opening have to
+    #      actually be coalesced into one cutout on the merged panel, so
+    #      fabrication sees one hole instead of two.
+
+    def _would_coalesce(a, b, tol=1.0):
+        """Physics-based check: if two holes touch at the seam and share an elevation, they are one window."""
+        if abs(a.get('y_in', 0.0) - b.get('y_in', 0.0)) > tol: return False
+        if abs(a.get('height_in', 0.0) - b.get('height_in', 0.0)) > tol: return False
+        
+        a_right = a.get('x_in', 0.0) + a.get('width_in', 0.0)
+        b_left = b.get('x_in', 0.0)
+        return abs(a_right - b_left) <= tol
+
+    def _coalesce_split_cutouts(cutouts, tol=1.5):
+        from collections import defaultdict
+        if not cutouts: return cutouts
+        _groups = defaultdict(list)
+        for _c in cutouts:
+            # Group by geometry instead of Revit ID
+            _grp_key = "geom_{}_{}".format(round(_c.get('y_in', 0.0), 1), round(_c.get('height_in', 0.0), 1))
+            _groups[(_grp_key, round(_c.get('y_in', 0.0), 2), round(_c.get('height_in', 0.0), 2))].append(_c)
+            
+        _out = []
+        for _grp in _groups.values():
+            if len(_grp) == 1:
+                _out.append(_grp[0])
+                continue
+            _grp.sort(key=lambda c: c.get('x_in', 0.0))
+            _merged = [dict(_grp[0])]
+            for _c in _grp[1:]:
+                _last = _merged[-1]
+                _last_right = _last.get('x_in', 0.0) + _last.get('width_in', 0.0)
+                if _c.get('x_in', 0.0) <= _last_right + tol:
+                    _new_right = max(_last_right, _c.get('x_in', 0.0) + _c.get('width_in', 0.0))
+                    _last['width_in'] = _new_right - _last.get('x_in', 0.0)
+                    _raw_last_right = _last.get('raw_x_in', 0.0) + _last.get('raw_width_in', 0.0)
+                    _raw_new_right  = max(_raw_last_right, _c.get('raw_x_in', 0.0) + _c.get('raw_width_in', 0.0))
+                    _last['raw_width_in'] = _raw_new_right - _last.get('raw_x_in', 0.0)
+                else:
+                    _merged.append(dict(_c))
+            _out.extend(_merged)
+        
+        return _out
+
+
+    def _effective_cutout_count(curr_cuts, next_cuts_shifted):
+        """How many distinct cutouts we'd end up with after welding + coalescing."""
+        _total = len(curr_cuts) + len(next_cuts_shifted)
+        _used_next = set()
+        for _c in curr_cuts:
+            for _ni, _n in enumerate(next_cuts_shifted):
+                if _ni in _used_next: continue
+                if _would_coalesce(_c, _n):
+                    _total -= 1
+                    _used_next.add(_ni)
+                    break
+        return _total
+
     welded_panels = []
     from collections import defaultdict
-    
+
     bands = defaultdict(list)
     for p in panels:
         bands[(round(p.y, 3), round(p.h, 3))].append(p)
-        
+
     global_max_w = constraints.long_max if horizontal_mode else constraints.max_width
     spacing = constraints.panel_spacing
-    
+
     for (y, h), band_panels in bands.items():
         band_panels.sort(key=lambda p: p.x)
 
         i = 0
         while i < len(band_panels):
             curr_p = band_panels[i]
-            
+
             j = i + 1
             while j < len(band_panels):
                 next_p = band_panels[j]
-                
+
                 # Break if they aren't touching or if they exceed max width
                 if abs((curr_p.x + curr_p.w + spacing) - next_p.x) > 0.1:
                     break
                 if (curr_p.w + spacing + next_p.w) > global_max_w:
                     break
-                    
-                # Limit to 2 cutouts per welded panel
-                curr_cutout_count = len(getattr(curr_p, 'cutouts', []) or [])
-                next_cutout_count = len(getattr(next_p, 'cutouts', []) or [])
-                if curr_cutout_count + next_cutout_count > 2:
+
+                # POST-COALESCE cutout count: two panels each holding half of
+                # a straddling opening count as ONE cutout on the merged panel,
+                # not two.
+                curr_cuts = list(getattr(curr_p, 'cutouts', []) or [])
+                shift_delta = curr_p.w + spacing
+                next_cuts_shifted = []
+                for _c in (getattr(next_p, 'cutouts', []) or []):
+                    _nc = dict(_c)
+                    _nc['x_in']     = _c.get('x_in', 0.0)     + shift_delta
+                    _nc['raw_x_in'] = _c.get('raw_x_in', 0.0) + shift_delta
+                    next_cuts_shifted.append(_nc)
+                if _effective_cutout_count(curr_cuts, next_cuts_shifted) > 2:
                     break
-                    
+
+                # Weld.
                 old_w = curr_p.w
-                curr_p.w = round(curr_p.w + spacing + next_p.w, 3) 
-                
-                # Safely merge cutouts without overwriting the left panel
-                if getattr(next_p, 'cutouts', []):
-                    if not getattr(curr_p, 'cutouts', []):
-                        curr_p.cutouts = []
-                    for c in next_p.cutouts:
-                        c_new = c.copy()
-                        c_new['x_in'] += (old_w + spacing)
-                        c_new['raw_x_in'] += (old_w + spacing)
-                        curr_p.cutouts.append(c_new)
-                        
+                curr_p.w = round(curr_p.w + spacing + next_p.w, 3)
+                if not getattr(curr_p, 'cutouts', None):
+                    curr_p.cutouts = []
+                for _c in next_cuts_shifted:
+                    curr_p.cutouts.append(_c)
+                # Coalesce split cutouts on this panel now that the join is
+                # sealed. Any straddling opening becomes one hole again.
+                curr_p.cutouts = _coalesce_split_cutouts(curr_p.cutouts)
+
                 j += 1
-                
+
             welded_panels.append(curr_p)
             i = j
-        
+
+
+    # --- CONTAINMENT DEDUP ---
+    # Only remove a panel that is FULLY contained inside another and whose
+    # cutouts are all also covered by the outer panel (matched by opening id).
+    # This kills T25-inside-T24 duplicates safely without touching partial
+    # overlaps like T23 sticking into T24's territory -- those panels carry
+    # different openings and removing either one leaves a coverage gap.
+    def _dedup_contained(panel_list):
+        from collections import defaultdict
+        if not panel_list: return panel_list
+        _bands = defaultdict(list)
+        for _i, _p in enumerate(panel_list):
+            _bands[(round(_p.y, 2), round(_p.h, 2))].append((_i, _p))
+        _removed = set()
+        _tol = 0.5  # in
+        for _band_panels in _bands.values():
+            _band_panels.sort(key=lambda ip: ip[1].w, reverse=True)  # widest first
+            for _a in range(len(_band_panels)):
+                _idx_a, _pa = _band_panels[_a]
+                if _idx_a in _removed: continue
+                _a_l = _pa.x
+                _a_r = _pa.x + _pa.w
+                _pa_ids = set(_c.get('id') for _c in (getattr(_pa, 'cutouts', []) or []))
+                for _b in range(_a + 1, len(_band_panels)):
+                    _idx_b, _pb = _band_panels[_b]
+                    if _idx_b in _removed: continue
+                    _b_l = _pb.x
+                    _b_r = _pb.x + _pb.w
+                    if _b_l < _a_l - _tol or _b_r > _a_r + _tol:
+                        continue  # not fully contained
+                    _pb_ids = set(_c.get('id') for _c in (getattr(_pb, 'cutouts', []) or []))
+                    if _pb_ids.issubset(_pa_ids):
+                        _removed.add(_idx_b)
+        if _removed:
+            print(Ansi.YELLOW + "  [DEDUP] Removed {} fully-contained duplicate panel(s) "
+                  "from minimize-unique output.".format(len(_removed)) + Ansi.RESET)
+        return [_p for _i, _p in enumerate(panel_list) if _i not in _removed]
+
+    welded_panels = _dedup_contained(welded_panels)
+
+    # ---- GAP DIAGNOSTIC ----
+    # Scan each (y, h) band and report any uncovered wall segment wider than
+    # tolerance. If gaps show up here, that's the smoking gun: some panel
+    # placement step left a real strip of wall uncovered. The output is
+    # exact x-ranges so we can trace it back to the responsible step.
+    def _report_gaps(panel_list, wall_w):
+        from collections import defaultdict
+        _bands = defaultdict(list)
+        for _p in panel_list:
+            _bands[(round(_p.y, 2), round(_p.h, 2))].append(_p)
+        _gap_tol = spacing + 0.05  # tolerance = spacing plus float noise
+        for (y_key, h_key), band in _bands.items():
+            band.sort(key=lambda p: p.x)
+            _cursor = 0.0
+            _gaps = []
+            for _p in band:
+                if _p.x > _cursor + _gap_tol:
+                    _gaps.append((round(_cursor, 2), round(_p.x, 2),
+                                  round(_p.x - _cursor, 2)))
+                _cursor = max(_cursor, _p.x + _p.w)
+            if _cursor + _gap_tol < wall_w:
+                _gaps.append((round(_cursor, 2), round(wall_w, 2),
+                              round(wall_w - _cursor, 2)))
+            if _gaps:
+                print(Ansi.RED + "  [GAP] band y={:.2f} h={:.2f}:".format(y_key, h_key) + Ansi.RESET)
+                for _s, _e, _w in _gaps:
+                    print(Ansi.RED + "        [{:.2f} .. {:.2f}]  ({:.2f}\" wide)".format(_s, _e, _w) + Ansi.RESET)
+
+    _report_gaps(welded_panels, wall_width)
 
     welded_panels.sort(key=lambda p: (p.y, p.x))
     for idx, p in enumerate(welded_panels, start=1): 
         p.name = "P{:02d}".format(idx)
         
+    # ==========================================
+    # 1. PASTE THE SHIFTER DEFINITION HERE
+    # ==========================================
+    def _accordion_seam_shifter(panels, openings, constraints, max_slide=4.0):
+        """
+        Slides panels left/right to align cutout offsets with a 'Master' twin,
+        absorbing the dimensional difference in the adjacent panels.
+        """
+        from collections import defaultdict
+        bands = defaultdict(list)
+        for p in panels:
+            bands[(round(p.y, 2), round(p.h, 2))].append(p)
+            
+        shifted_count = 0
+        global_max_w = constraints.long_max if str(orientation).lower() == 'horizontal' else constraints.max_width
+        
+        for (y, h), band_panels in bands.items():
+            band_panels.sort(key=lambda p: p.x)
+            
+            sig_groups = defaultdict(list)
+            for i, p in enumerate(band_panels):
+                cuts = getattr(p, 'cutouts', []) or []
+                if not cuts: continue 
+                sig = (round(p.w, 1), round(p.h, 1), len(cuts))
+                sig_groups[sig].append(i)
+                
+            for sig, indices in sig_groups.items():
+                if len(indices) < 2: continue
+                master_idx = indices[0]
+                master_p = band_panels[master_idx]
+                master_cuts = getattr(master_p, 'cutouts', [])
+                
+                for idx in indices[1:]:
+                    target_p = band_panels[idx]
+                    target_cuts = getattr(target_p, 'cutouts', [])
+                    
+                    master_x_in = master_cuts[0].get('x_in', 0.0)
+                    target_x_in = target_cuts[0].get('x_in', 0.0)
+                    slide_dist = target_x_in - master_x_in
+                    
+                    if abs(slide_dist) < 0.1 or abs(slide_dist) > max_slide:
+                        continue 
+                        
+                    if idx == 0 or idx == len(band_panels) - 1:
+                        continue 
+                        
+                    left_neighbor = band_panels[idx - 1]
+                    right_neighbor = band_panels[idx + 1]
+                    
+                    new_left_w = left_neighbor.w + slide_dist
+                    new_right_w = right_neighbor.w - slide_dist
+                    
+                    if not (constraints.min_width <= new_left_w <= global_max_w): continue
+                    if not (constraints.min_width <= new_right_w <= global_max_w): continue
+                    
+                    left_neighbor.w = round(new_left_w, 3)
+                    target_p.x = round(target_p.x + slide_dist, 3)
+                    right_neighbor.x = round(right_neighbor.x + slide_dist, 3)
+                    right_neighbor.w = round(new_right_w, 3)
+                    
+                    left_neighbor.cutouts = calculate_panel_cutouts(left_neighbor, openings)
+                    target_p.cutouts = calculate_panel_cutouts(target_p, openings)
+                    right_neighbor.cutouts = calculate_panel_cutouts(right_neighbor, openings)
+                    
+                    shifted_count += 1
+                    print(Ansi.CYAN + "  [SEAM SHIFT] Aligned {} with Master {} (Slid {:.2f}\")"
+                          .format(target_p.name, master_p.name, slide_dist) + Ansi.RESET)
+                          
+        return [p for band in bands.values() for p in band]
+
+    # ==========================================
+    # 2. PASTE THE AUDITOR DEFINITION HERE
+    # ==========================================
+    def _verify_facade_integrity(panels, constraints):
+        """Sweeps the final layout to guarantee zero gaps and zero overlaps."""
+        from collections import defaultdict
+        bands = defaultdict(list)
+        for p in panels:
+            bands[(round(p.y, 2), round(p.h, 2))].append(p)
+            
+        spacing = constraints.panel_spacing
+        global_max_w = constraints.long_max if str(orientation).lower() == 'horizontal' else constraints.max_width
+        errors = 0
+        
+        for (y, h), band_panels in bands.items():
+            band_panels.sort(key=lambda p: p.x)
+            for i in range(len(band_panels)):
+                p = band_panels[i]
+                if p.w < constraints.min_width - 0.1:
+                    print(Ansi.RED + "  [AUDIT FAIL] {} width ({:.2f}\") is UNDER min limit.".format(p.name, p.w) + Ansi.RESET)
+                    errors += 1
+                if p.w > global_max_w + 0.1:
+                    print(Ansi.RED + "  [AUDIT FAIL] {} width ({:.2f}\") is OVER max limit.".format(p.name, p.w) + Ansi.RESET)
+                    errors += 1
+                if i < len(band_panels) - 1:
+                    next_p = band_panels[i+1]
+                    delta = next_p.x - (p.x + p.w + spacing)
+                    if delta > 0.1:
+                        print(Ansi.RED + "  [AUDIT FAIL] GAP DETECTED! {:.2f}\" gap between {} and {}.".format(delta, p.name, next_p.name) + Ansi.RESET)
+                        errors += 1
+                    elif delta < -0.1:
+                        print(Ansi.RED + "  [AUDIT FAIL] OVERLAP DETECTED! {:.2f}\" collision between {} and {}.".format(abs(delta), p.name, next_p.name) + Ansi.RESET)
+                        errors += 1
+        if errors == 0:
+            print(Ansi.GREEN + "  [AUDIT PASS] Facade geometry is perfectly sealed." + Ansi.RESET)
+
+    # ==========================================
+    # 3. CALL THEM BOTH BEFORE RETURNING
+    # ==========================================
+    welded_panels = _accordion_seam_shifter(welded_panels, openings, constraints)
+    _verify_facade_integrity(welded_panels, constraints)
+    
     return welded_panels
+    
+
 
         
 def _rebuild_aligned_columns(records, ext_openings, eff_w, constraints):
@@ -2533,29 +2833,70 @@ def process_all_walls(walls_rows, openings_rows, output_dir,
             wall_map=wall_map,
             wall_geom=_wall_geom  # <-- Passed to project local coords onto the facade vector
         )
+        # ---- [DIAG] opening pipeline stage 1: routing ----
+        _wm_hosts = sorted(wall_map.get(str(wall_id), set())) if wall_map else []
+        print(Ansi.CYAN + "  [DIAG wall={}] stage1 get_wall_openings: {} opening(s)  "
+              "wall_map_hosts={}".format(wall_id, len(openings), _wm_hosts or "(self only)") + Ansi.RESET)
+        if openings:
+            for _op in openings[:6]:
+                print(Ansi.CYAN + "    op id={} type={} x={:.1f} y={:.1f} w={:.1f} h={:.1f}"
+                      .format(_op.id, getattr(_op, 'type', '?'), _op.x, _op.y, _op.w, _op.h) + Ansi.RESET)
+            if len(openings) > 6:
+                print(Ansi.CYAN + "    ... {} more".format(len(openings) - 6) + Ansi.RESET)
 
-        # True Corner Detection (Butt Joints)
+
+        # --- SEAM DETECTOR (True Corners & Colinear Facades) ---
         _p_start_ext = 0.0
         _p_end_ext = 0.0
+        
+        try: _spacing = ACTIVE_CONFIG.panel_constraints.panel_spacing
+        except: _spacing = 0.125
+
         if _start_xyz and _end_xyz:
-            for p_pt, p_dir in processed_endpoints:
-                if math.sqrt((_start_xyz[0]-p_pt[0])**2 + (_start_xyz[1]-p_pt[1])**2 + (_start_xyz[2]-p_pt[2])**2) < 1.0: 
-                    if abs(_wall_geom["wall_dir_x"]*p_dir[0] + _wall_geom["wall_dir_y"]*p_dir[1] + _wall_geom["wall_dir_z"]*p_dir[2]) < 0.5:
-                        _p_start_ext = -panel_thick_in
-                        break
-            for p_pt, p_dir in processed_endpoints:
-                if math.sqrt((_end_xyz[0]-p_pt[0])**2 + (_end_xyz[1]-p_pt[1])**2 + (_end_xyz[2]-p_pt[2])**2) < 1.0:
-                    if abs(_wall_geom["wall_dir_x"]*p_dir[0] + _wall_geom["wall_dir_y"]*p_dir[1] + _wall_geom["wall_dir_z"]*p_dir[2]) < 0.5:
-                        _p_end_ext = -panel_thick_in
-                        break
-            current_dir = (_wall_geom["wall_dir_x"], _wall_geom["wall_dir_y"], _wall_geom["wall_dir_z"])
-            processed_endpoints.append((_start_xyz, current_dir))
-            processed_endpoints.append((_end_xyz, current_dir))
+            # Omni-Scan: Check this wall against all other walls in the dataset
+            for other_w in walls_rows:
+                if other_w == wall_row: continue
+                o_s = _parse_xyz(other_w.get("Start(X,Y,Z)", ""))
+                o_e = _parse_xyz(other_w.get("End(X,Y,Z)", ""))
+                if not (o_s and o_e): continue
+                
+                # Calculate the neighboring wall's vector
+                dx, dy, dz = o_e[0]-o_s[0], o_e[1]-o_s[1], o_e[2]-o_s[2]
+                mag = math.sqrt(dx**2 + dy**2 + dz**2)
+                if mag == 0: continue
+                odir = (dx/mag, dy/mag, dz/mag)
+                
+                # Check Start Point Interactions
+                if math.sqrt((_start_xyz[0]-o_s[0])**2 + (_start_xyz[1]-o_s[1])**2 + (_start_xyz[2]-o_s[2])**2) < 1.0 or \
+                   math.sqrt((_start_xyz[0]-o_e[0])**2 + (_start_xyz[1]-o_e[1])**2 + (_start_xyz[2]-o_e[2])**2) < 1.0:
+                    dot = _wall_geom["wall_dir_x"]*odir[0] + _wall_geom["wall_dir_y"]*odir[1] + _wall_geom["wall_dir_z"]*odir[2]
+                    if abs(dot) < 0.5:
+                        _p_start_ext = -panel_thick_in # It's a 90-degree corner
+                    elif abs(dot) > 0.8:
+                        _p_start_ext = -(_spacing / 2.0) # It's a flat colinear facade connection
+                
+                # Check End Point Interactions
+                if math.sqrt((_end_xyz[0]-o_s[0])**2 + (_end_xyz[1]-o_s[1])**2 + (_end_xyz[2]-o_s[2])**2) < 1.0 or \
+                   math.sqrt((_end_xyz[0]-o_e[0])**2 + (_end_xyz[1]-o_e[1])**2 + (_end_xyz[2]-o_e[2])**2) < 1.0:
+                    dot = _wall_geom["wall_dir_x"]*odir[0] + _wall_geom["wall_dir_y"]*odir[1] + _wall_geom["wall_dir_z"]*odir[2]
+                    if abs(dot) < 0.5:
+                        _p_end_ext = -panel_thick_in # It's a 90-degree corner
+                    elif abs(dot) > 0.8:
+                        _p_end_ext = -(_spacing / 2.0) # It's a flat colinear facade connection
+
 
         _eff_wall_w = wall_width + _p_start_ext + _p_end_ext
         import copy as _cp_ext
         _ext_openings = _cp_ext.deepcopy(openings)
         for _eo in _ext_openings: _eo.x += _p_start_ext
+        # ---- [DIAG] opening pipeline stage 2: corner-extension shift ----
+        if _p_start_ext != 0.0 or _p_end_ext != 0.0:
+            _oob_ct = sum(1 for _o in _ext_openings
+                          if _o.x + _o.w <= 0 or _o.x >= _eff_wall_w)
+            print(Ansi.CYAN + "  [DIAG wall={}] stage2 corner shift: "
+                  "start_ext={:.2f} end_ext={:.2f} eff_w={:.2f} "
+                  "openings out-of-wall={}".format(
+                      wall_id, _p_start_ext, _p_end_ext, _eff_wall_w, _oob_ct) + Ansi.RESET)
 
         # Elevation bands and process_wall loop
         _wall_h_in, _base_z_in, _max_ph_in = wall_height, wall_base_z * 12.0, ACTIVE_CONFIG.panel_constraints.max_height
@@ -2573,6 +2914,10 @@ def process_all_walls(walls_rows, openings_rows, output_dir,
         for _y0, _y1 in _bands:
             _band_h_in = _y1 - _y0
             _band_ops  = _clip_openings_to_band(_ext_openings, _y0, _y1)
+            # ---- [DIAG] opening pipeline stage 3: band clipping ----
+            print(Ansi.CYAN + "  [DIAG wall={}] stage3 band y=[{:.1f}, {:.1f}]: "
+                  "{} opening(s) survive clip".format(
+                      wall_id, _y0, _y1, len(_band_ops)) + Ansi.RESET)
             
             try:
                 _band_recs = process_wall(wall_id, _eff_wall_w, _band_h_in, _band_ops)
@@ -2589,11 +2934,25 @@ def process_all_walls(walls_rows, openings_rows, output_dir,
                 _process_wall_errors.append(
                     (wall_id, _y0, _y1, type(_e).__name__, str(_e)))
                 _band_recs = []
+            # ---- [DIAG] opening pipeline stage 4: cutouts written per band ----
+            _with_cut = sum(1 for _r in _band_recs if _r.get("cutouts_json"))
+            print(Ansi.CYAN + "  [DIAG wall={}] stage4 band y=[{:.1f}, {:.1f}]: "
+                  "{} panel(s) placed, {} with cutouts".format(
+                      wall_id, _y0, _y1, len(_band_recs), _with_cut) + Ansi.RESET)
             for _r in _band_recs: _r["y_in"] = round(_r["y_in"] + _y0, 4)
             panel_records.extend(_band_recs)
         if str(orientation).lower() != 'horizontal':
+            # ---- [DIAG] opening pipeline stage 5: pre-align cutout accounting ----
+            _pre_cut = sum(1 for _r in panel_records if _r.get("cutouts_json"))
             panel_records = _align_courses_to_piers(
                 panel_records, _ext_openings, _eff_wall_w, ACTIVE_CONFIG.panel_constraints)
+            _post_cut = sum(1 for _r in panel_records if _r.get("cutouts_json"))
+            _delta = _post_cut - _pre_cut
+            _tag = "OK" if _delta == 0 else ("LOST {}".format(-_delta) if _delta < 0 else "GAINED {}".format(_delta))
+            _color = Ansi.CYAN if _delta == 0 else Ansi.RED
+            print(_color + "  [DIAG wall={}] stage5 _align_courses_to_piers: "
+                  "cutouts before={} after={} ({})".format(
+                      wall_id, _pre_cut, _post_cut, _tag) + Ansi.RESET)
         for _idx, _r in enumerate(panel_records, start=1): _r["panel_name"] = "P{:02d}".format(_idx)
 
         # Shift x_in back to wall_origin coordinates
@@ -2614,13 +2973,21 @@ def process_all_walls(walls_rows, openings_rows, output_dir,
         # --- LIVE PANEL SET ---
         _types_before = panel_library.unique_count()
         _reused_here = 0
+        _cut_lost_to_lib = 0
         for _pr in panel_records:
+            _had_cut = bool(_pr.get("cutouts_json"))
             _label, _was_reused = panel_library.register(_pr)
+            _has_cut_now = bool(_pr.get("cutouts_json"))
+            if _had_cut and not _has_cut_now:
+                _cut_lost_to_lib += 1
             if _was_reused:
                 _reused_here += 1
         _added_here = panel_library.unique_count() - _types_before
         print(Ansi.GREEN + "  [PANEL SET] Wall {}: {} reused / {} new type(s)"
               .format(wall_id, _reused_here, _added_here) + Ansi.RESET)
+        if _cut_lost_to_lib > 0:
+            print(Ansi.RED + "  [DIAG wall={}] stage6 panel_library.register STRIPPED "
+                  "cutouts from {} panel(s)".format(wall_id, _cut_lost_to_lib) + Ansi.RESET)
 
         all_panel_records.extend(panel_records)
 
@@ -2913,7 +3280,8 @@ class PanelLibrary(object):
 
         # 1) EXACT strict twin -> inherit master floats, keep own (identical) dims.
         if canon in self.types:
-            return self._absorb(record, self.types[canon], w, is_mir, snap_dims=False)
+            return self._absorb(record, self.types[canon], w, is_mir,
+                                snap_dims=False, original_cutouts=cutouts)
 
         # 2) NEAR twin within merge_tol (Option 2). Collapses measurement/algorithm
         #    drift (e.g. 305.000 vs 305.625) into one real fabrication type. The
@@ -2923,7 +3291,8 @@ class PanelLibrary(object):
             near = self._find_near(w, h, cutouts)
             if near is not None:
                 self._merged += 1
-                return self._absorb(record, near, w, is_mir, snap_dims=True)
+                return self._absorb(record, near, w, is_mir,
+                                    snap_dims=True, original_cutouts=cutouts)
 
         # 3) Brand-new type.
         self._counter += 1
@@ -2937,20 +3306,69 @@ class PanelLibrary(object):
         record["panel_name"] = "{}-P{:02d}".format(label, 1)
         return label, False
 
-    def _absorb(self, record, t, w, is_mir, snap_dims):
+    def _absorb(self, record, t, w, is_mir, snap_dims, original_cutouts=None):
         """Attach `record` to existing type `t`, inheriting master cutout floats.
-        If snap_dims, also adopt the master's width/height (near-merge case)."""
+        If snap_dims, also adopt the master's width/height (near-merge case).
+
+        Cutout identity (opening id + type string) is preserved from the
+        child's own cutout data, not copied from the master. Without this,
+        every reuse of a type would relabel the child's opening ids to the
+        master's, so a single opening id like 7708158 could end up stamped
+        on 3+ physically distinct openings across the wall."""
         import copy, json
         t["count"] += 1
         t["reused"] = True
         ref_w = t["w"] if snap_dims else w
+
+        # If the caller didn't pass the record's original cutouts, re-parse
+        # them so this method stays safe to call from any entry point.
+        if original_cutouts is None:
+            original_cutouts = (json.loads(record["cutouts_json"])
+                                if record.get("cutouts_json") else [])
+        flip_needed = (is_mir != t["is_mirrored"])
+
+        # Build (mirror-corrected x_in, y_in) keys for the child cutouts so
+        # we can pair them with master cutouts by geometry regardless of the
+        # order they arrived in.
+        _child_by_key = []
+        for oc in original_cutouts:
+            _ox = oc.get("x_in", 0.0)
+            _oy = oc.get("y_in", 0.0)
+            _ow = oc.get("width_in", 0.0)
+            _oh = oc.get("height_in", 0.0)
+            _cx = (ref_w - _ox - _ow) if flip_needed else _ox
+            _child_by_key.append({
+                "cx": _cx, "cy": _oy, "cw": _ow, "ch": _oh, "data": oc,
+            })
+
+        def _find_match(mc):
+            _tol = 1.0  # inches; matches _find_near cutout tolerance
+            _mx = mc.get("x_in", 0.0)
+            _my = mc.get("y_in", 0.0)
+            _mw = mc.get("width_in", 0.0)
+            _mh = mc.get("height_in", 0.0)
+            for _e in _child_by_key:
+                if (abs(_e["cx"] - _mx) < _tol and
+                    abs(_e["cy"] - _my) < _tol and
+                    abs(_e["cw"] - _mw) < _tol and
+                    abs(_e["ch"] - _mh) < _tol):
+                    return _e["data"]
+            return None
+
         new_cutouts = []
         for mc in t["cutouts"]:
             nc = copy.deepcopy(mc)
-            if is_mir != t["is_mirrored"]:
+            if flip_needed:
                 nc["x_in"]     = ref_w - mc["x_in"]     - mc["width_in"]
                 nc["raw_x_in"] = ref_w - mc["raw_x_in"] - mc["raw_width_in"]
+            # Inherit the child's opening identity for this cutout.
+            _oc = _find_match(nc)
+            if _oc is not None:
+                for _k in ("id", "type"):
+                    if _k in _oc:
+                        nc[_k] = _oc[_k]
             new_cutouts.append(nc)
+
         record["cutouts_json"] = json.dumps(new_cutouts) if new_cutouts else ""
         if snap_dims:
             record["width_in"]  = t["w"]

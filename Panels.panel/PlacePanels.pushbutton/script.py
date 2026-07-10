@@ -59,7 +59,7 @@ _PARAM_DUMP_DONE = [False]
 # left/right panel span and nudge it if the family origin/reference planes are
 # not exactly centered on visible geometry.
 ENABLE_BBOX_SPAN_ALIGNMENT = True
-BBOX_ALIGN_TOLERANCE_IN = 0.125
+BBOX_ALIGN_TOLERANCE_IN = 0.001
 
 # --- VOID CONTROL ---
 ENABLE_VOID_CONTROL = True
@@ -595,6 +595,23 @@ def place_panel_family(wall, panel, symbol, extra_z_offset_in=0.0, is_cutout=Fal
             inst = doc.Create.NewFamilyInstance(pt, symbol, StructuralType.NonStructural)
             if extra_z_offset_in == 0:
                 print("  [PLACE] Free-hosted (no level): {0}".format(panel.get("panel_name", "")))
+                
+        # =================================================================
+        # THE WRAP FIX: FORCE HIDDEN SETBACKS TO ZERO
+        # The API can see these parameters even if the Revit UI hides them.
+        # =================================================================
+        try:
+            wrap_left = inst.LookupParameter("Sheathing Wrap_Left")
+            if wrap_left and not wrap_left.IsReadOnly:
+                wrap_left.Set(0.0)
+                
+            wrap_right = inst.LookupParameter("Sheathing Wrap_Right")
+            if wrap_right and not wrap_right.IsReadOnly:
+                wrap_right.Set(0.0)
+        except Exception as e:
+            pass
+        # =================================================================
+
     except Exception as e:
         print("[ERROR] Placement failed for {0}: {1}".format(panel.get("panel_name", "?"), e))
         return None
