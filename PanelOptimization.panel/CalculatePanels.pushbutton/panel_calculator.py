@@ -1135,8 +1135,22 @@ def _core_place_panels_sequential(wall_width, wall_height, openings, constraints
             # --- FIX: TALL VERTICAL STACKING ---
             # Horizontal panels stack at SHORT_MAX (138"). Vertical panels stack at LONG_MAX (348").
             h_limit = SHORT_MAX if local_horizontal else LONG_MAX
-            
+
             bh = snap_down(min(rem_h, h_limit), DIMENSION_INCREMENT)
+
+            # --- PARAPET ABSORBER ---
+            # In horizontal mode, if capping this band at h_limit would leave
+            # a remainder that fits within the flexible top allowance (e.g.,
+            # a 24" parapet strip on top of a 138" course), extend this band
+            # to swallow the remainder instead of adding a short splinter
+            # band. This is what makes the "Flexible Top Panel Allowance
+            # (Absorb Parapet)" config setting actually take effect on
+            # horizontal panels.
+            if local_horizontal and parapet_allowance > 0:
+                would_leave = rem_h - bh
+                if 0 < would_leave <= parapet_allowance:
+                    bh = snap_down(rem_h, DIMENSION_INCREMENT)
+
             if bh >= PANEL_HEIGHT_MIN:
                 bands.append((cy, cy + bh))
                 cy += bh
@@ -1147,6 +1161,7 @@ def _core_place_panels_sequential(wall_width, wall_height, openings, constraints
                 else:
                     bands.append((0, wall_height))
                 break
+            
 
         for y_start, y_end in bands:
             band_height = y_end - y_start
@@ -1758,23 +1773,34 @@ def _clip_openings_to_band(openings, y0_in, y1_in):
     return result
 
 
-def _floor_bands(wall_h, rel_elevs, min_band=24.0, max_band=None):
+def _floor_bands(wall_h, rel_elevs, min_band=24.0, max_band=None, parapet_allowance=0.0):
     """One band per storey: slice the wall at every interior level elevation so
     each panel spans floor-to-floor. Used when 'limit panel height to floor' is on.
 
     Coverage runs base (0) -> true wall top (wall_h), so a parapet above the top
-    level is included. Two corrections keep every band fabricable AND covered:
-      * A band shorter than min_band (a sub-fabricable remnant, e.g. a short
-        parapet) is MERGED into its neighbour rather than dropped.
+    level is included. Three corrections keep every band fabricable AND covered:
+      * If the topmost segment (parapet strip) is <= parapet_allowance, MERGE it
+        into the underlying floor band so the top panel absorbs the parapet
+        instead of shipping as a sub-fabricable stub.
+      * A band shorter than min_band (a sub-fabricable remnant) is MERGED into
+        its neighbour rather than dropped.
       * A band taller than max_band (e.g. a merged floor+parapet that exceeds the
-        horizontal Short Max) is SPLIT into equal legal courses rather than
-        capped-and-dropped. Pass max_band = short_max for horizontal,
-        long_max for vertical.
-    The only departures from exact floor-to-floor are these two cases, and both
-    exist solely to cover the wall with buildable panels."""
+        horizontal Short Max) is SPLIT into equal legal courses -- EXCEPT the
+        top band, which is allowed to exceed max_band by up to parapet_allowance
+        so the parapet absorption isn't undone. Pass max_band = short_max for
+        horizontal, long_max for vertical."""
     import math
     bnds = [0.0] + [float(e) for e in rel_elevs if 0.0 < float(e) < wall_h] + [float(wall_h)]
     bnds = sorted(set(round(b, 4) for b in bnds))
+
+    # --- PARAPET ABSORBER ---
+    # If the topmost segment is a parapet strip within the flexible-top allowance,
+    # remove the level break beneath it so it merges into the underlying floor.
+    if parapet_allowance > 0 and len(bnds) >= 3:
+        top_segment = bnds[-1] - bnds[-2]
+        if 0 < top_segment <= parapet_allowance + 1e-6:
+            del bnds[-2]
+
     # Merge any band below the minimum fabricable height into its neighbour.
     changed = True
     while changed and len(bnds) > 2:
@@ -1791,9 +1817,16 @@ def _floor_bands(wall_h, rel_elevs, min_band=24.0, max_band=None):
     # [FIX] Split any band taller than the max panel height greedily, pushing min_band to the top.
     if max_band and max_band > 0:
         out = []
-        for a, b in bands:
+        n_bands = len(bands)
+        for idx, (a, b) in enumerate(bands):
             h = b - a
-            if h > max_band + 1e-6:
+            # --- PARAPET EXEMPTION ---
+            # The top band is allowed to exceed max_band by up to
+            # parapet_allowance -- otherwise the split logic here would undo the
+            # absorption we just did above.
+            is_top_band = (idx == n_bands - 1)
+            effective_max = max_band + (parapet_allowance if is_top_band else 0.0)
+            if h > effective_max + 1e-6:
                 cy = a
                 while cy < b:
                     rem_h = b - cy
@@ -1801,14 +1834,14 @@ def _floor_bands(wall_h, rel_elevs, min_band=24.0, max_band=None):
                         bh = rem_h - min_band
                     else:
                         bh = min(rem_h, max_band)
-                        
+
                     if bh < min_band:
                         if out and out[-1][1] == cy:
                             out[-1] = (out[-1][0], b)
                         else:
                             out.append((cy, b))
                         break
-                        
+
                     out.append((round(cy, 4), round(cy + bh, 4)))
                     cy += bh
             else:
@@ -2903,10 +2936,13 @@ def process_all_walls(walls_rows, openings_rows, output_dir,
         try: _lvl_abs_in = json.loads(wall_row.get("LevelElevations(in)", "[]"))
         except: _lvl_abs_in = []
         _rel_elevs = sorted({round(e - _base_z_in, 2) for e in _lvl_abs_in if 6.0 < (e - _base_z_in) < (_wall_h_in - 6.0)})
+
         if getattr(ACTIVE_CONFIG.optimization_strategy, 'limit_panel_height_to_floor', False):
             _pc = ACTIVE_CONFIG.panel_constraints
             _max_band = _pc.short_max if str(orientation).lower() == 'horizontal' else _pc.long_max
-            _bands = _floor_bands(_wall_h_in, _rel_elevs, _pc.min_height, _max_band)
+            _parapet = float(getattr(ACTIVE_CONFIG.optimization_strategy,
+                                     'flexible_top_panel_allowance_in', 0.0) or 0.0)
+            _bands = _floor_bands(_wall_h_in, _rel_elevs, _pc.min_height, _max_band, _parapet)
         else:
             _bands = _compute_elevation_bands(_wall_h_in, _rel_elevs, _max_ph_in)
 

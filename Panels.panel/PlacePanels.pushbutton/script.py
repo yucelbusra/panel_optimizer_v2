@@ -588,35 +588,16 @@ def place_panel_family(wall, panel, symbol, extra_z_offset_in=0.0, is_cutout=Fal
         lvl = get_wall_base_level(wall)
         if lvl:
             pt_rel = XYZ(pt.X, pt.Y, pt.Z - lvl.Elevation)
-            inst = doc.Create.NewFamilyInstance(pt_rel, symbol, lvl, StructuralType.NonStructural)
-            if extra_z_offset_in == 0:
-                print("  [PLACE] Level-hosted (Z={0:.3f} ft): {1}".format(pt_rel.Z, panel.get("panel_name", "")))
-        else:
+
             inst = doc.Create.NewFamilyInstance(pt, symbol, StructuralType.NonStructural)
             if extra_z_offset_in == 0:
-                print("  [PLACE] Free-hosted (no level): {0}".format(panel.get("panel_name", "")))
-                
-        # =================================================================
-        # THE WRAP FIX: FORCE HIDDEN SETBACKS TO ZERO
-        # The API can see these parameters even if the Revit UI hides them.
-        # =================================================================
-        try:
-            wrap_left = inst.LookupParameter("Sheathing Wrap_Left")
-            if wrap_left and not wrap_left.IsReadOnly:
-                wrap_left.Set(0.0)
-                
-            wrap_right = inst.LookupParameter("Sheathing Wrap_Right")
-            if wrap_right and not wrap_right.IsReadOnly:
-                wrap_right.Set(0.0)
-        except Exception as e:
-            pass
-        # =================================================================
-
+                    print("  [PLACE] Free-hosted (no level): {0}".format(panel.get("panel_name", "")))
     except Exception as e:
         print("[ERROR] Placement failed for {0}: {1}".format(panel.get("panel_name", "?"), e))
         return None
 
     doc.Regenerate()
+
 
     if ROTATION_OVERRIDE_DEG is not None:
         if abs(ROTATION_OVERRIDE_DEG) > 0.001:
@@ -633,16 +614,46 @@ def place_panel_family(wall, panel, symbol, extra_z_offset_in=0.0, is_cutout=Fal
         if w_in > 0 and h_in > 0:
             set_size_parameters(inst, w_in, h_in, symbol)
             doc.Regenerate()
+
+            # =================================================================
+            # THE WRAP FIX: FORCE HIDDEN SETBACKS TO ZERO
+            # Setting the Width parameter can cause the family to re-derive
+            # Sheathing Wrap_Left/Right to nonzero values. Zero them AFTER
+            # width is set and BEFORE alignment, so the geometry we measure
+            # in align is the geometry we want to keep.
+            # =================================================================
+            try:
+                wrap_left = inst.LookupParameter("Sheathing Wrap_Left")
+                if wrap_left and not wrap_left.IsReadOnly:
+                    wrap_left.Set(0.0)
+                wrap_right = inst.LookupParameter("Sheathing Wrap_Right")
+                if wrap_right and not wrap_right.IsReadOnly:
+                    wrap_right.Set(0.0)
+                doc.Regenerate()
+            except Exception:
+                pass
+
             align_instance_bbox_to_csv_span(inst, wall, panel)
             doc.Regenerate()
         else:
             print("  [WARN] Zero/missing size for {0}".format(panel.get("panel_name", "?")))
     except Exception as e:
         print("  [WARN] Size/alignment failed for {0}: {1}".format(panel.get("panel_name", "?"), e))
-
+    
     if not is_cutout:
         set_void_parameters_for_cutouts(inst, panel)
         doc.Regenerate()
+        # Voids may have shifted the outer bounds via family formulas.
+        # Re-snap the left edge to the CSV target.
+        try:
+            w_in = _safe_float(panel.get("width_in", 0))
+            h_in = _safe_float(panel.get("height_in", 0))
+            if w_in > 0 and h_in > 0:
+                align_instance_bbox_to_csv_span(inst, wall, panel)
+                doc.Regenerate()
+        except Exception as e:
+            print("  [WARN] Re-align after voids failed for {0}: {1}".format(panel.get("panel_name", "?"), e))
+
 
     try:
         p = _find_param_by_candidates(inst, ["Name", "Panel Name", "Mark"])
