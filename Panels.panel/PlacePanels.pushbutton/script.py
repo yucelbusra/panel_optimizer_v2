@@ -141,12 +141,40 @@ def norm_id(val):
 
 def get_wall_by_id(wall_id):
     try:
+        # 1. Clean the string to a pure Python integer
         elem_id = int(float(wall_id))
-        element = doc.GetElement(ElementId(elem_id))
-        if isinstance(element, Wall):
-            return element
-    except:
-        pass
+        
+        # 2. Explicitly load the .NET System library to handle 64-bit IDs
+        import clr
+        clr.AddReference("System")
+        import System
+        
+        e_id = None
+        try:
+            # Revit 2024+ (Strict Int64)
+            e_id = ElementId(System.Int64(elem_id))
+        except Exception as e_64:
+            try:
+                # Fallback for Revit 2023 and older
+                e_id = ElementId(elem_id)
+            except Exception as e_32:
+                print("  [DEBUG] ElementId cast failed. 64-bit error: {} | 32-bit error: {}".format(e_64, e_32))
+                return None
+                
+        # 3. Retrieve and verify the wall geometry
+        if e_id:
+            element = doc.GetElement(e_id)
+            if element:
+                if isinstance(element, Wall):
+                    return element
+                else:
+                    print("  [DEBUG] Element {} found, but it is a {} (not a Basic Wall).".format(elem_id, type(element)))
+            else:
+                print("  [DEBUG] doc.GetElement returned None for ID {}. Is the wall deleted or in a linked model?".format(elem_id))
+                
+    except Exception as main_err:
+        print("  [DEBUG] Total crash in get_wall_by_id for ID {}: {}".format(wall_id, main_err))
+        
     return None
 
 def _feet(val_inch):

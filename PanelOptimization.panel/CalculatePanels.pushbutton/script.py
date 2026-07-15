@@ -318,28 +318,6 @@ class ConfigDialog(Form):
         self._scroll.Controls.Add(desc_row)
         y += desc_h + 1
 
-        y = self._section(y, "Sub-Strategies (Applies to 'Minimize Unique' only)")
-        
-        _cur_align = getattr(os_, "opening_alignment", "opening_derived")
-        _align_rev = {
-            "opening_derived": "Opening-Derived Width",
-            "center":          "Center Openings",
-            "set_x_offset":    "Set X Offset",
-        }
-        _cur_align_lbl = _align_rev.get(_cur_align, "Opening-Derived Width")
-        
-        y = self._radio_row(y, "Window Alignment", ["Opening-Derived Width", "Center Openings", "Set X Offset"], 
-                            _cur_align_lbl, "_rb_align")
-                            
-        y = self._num_row(y, "Void 1 X Offset Left (if 'Set X Offset')", getattr(os_, "void1_x_offset_left", 6.0), "_void1_x_offset_left")
-        
-        _cur_nw = getattr(os_, "nonwindow_strategy", "largest")
-        _nw_rev = {"largest": "Minimize Total Panels", "standardise": "Identical (match standard W)"}
-        _cur_nw_lbl = _nw_rev.get(_cur_nw, "Minimize Total Panels")
-        
-        y = self._radio_row(y, "No-Opening Blank Walls", ["Minimize Total Panels", "Identical (match standard W)"], 
-                            _cur_nw_lbl, "_rb_nw")
-        
         
         # TAB 2: Physical Constraints
         tab_dims = TabPage("2. Panel Constraints")
@@ -563,80 +541,6 @@ class ConfigDialog(Form):
             self._scroll.Controls.Add(_dr)
             y += DESC_H + 1
 
-        # ── Panels WITH openings ─────────────────────────────────────────
-        y = self._section(y, "  Panels with Openings  (applies when Minimize Unique is selected)")
-        _cur_align = getattr(os_, "opening_alignment", "opening_derived")
-        _align_rev = {
-            "opening_derived": "Opening-Derived Width",
-            "center":          "Center Openings",
-            "set_x_offset":    "Set X Offset",
-        }
-        _cur_align_lbl = _align_rev.get(_cur_align, "Opening-Derived Width")
-        y = self._radio_row(y, "Panel-with-Opening Strategy",
-                            ["Opening-Derived Width", "Center Openings", "Set X Offset"],
-                            _cur_align_lbl, "_rb_align")
-
-        ALIGN_DESC_H = self._ROW_H * 2 + _scale(4, _DPI_SCALE)
-        for _adesc in [
-            ("Opening-Derived Width: W = window_spacing - panel_spacing + window_width. "
-             "Produces the largest identical panel possible from the window geometry. "
-             "Void 1 X Offset Left and Right are derived automatically."),
-            ("Center Openings: Finds the most-repeated panel width, then centres the "
-             "opening: Void 1 X Offset Left = Void 1 X Offset Right = (W - window_width) / 2."),
-            ("Set X Offset: Finds the most-repeated panel width, then uses your specified "
-             "Void 1 X Offset Left. Right offset = W - window_width - left_offset."),
-        ]:
-            _dr = self._make_row(y, CLR_ROW_ALT, ALIGN_DESC_H)
-            _dl = Label()
-            _dl.Text      = _adesc
-            _dl.Font      = FNT_SMALL
-            _dl.ForeColor = Color.FromArgb(80, 80, 80)
-            _dl.AutoSize  = False
-            row_w2 = self._scroll.ClientSize.Width
-            if row_w2 < 100: row_w2 = self.ClientSize.Width - 20
-                
-            _dl.Size     = Size(max(row_w2 - _scale(30, _DPI_SCALE), _scale(400, _DPI_SCALE)),
-                                ALIGN_DESC_H - _scale(4, _DPI_SCALE))
-            _dl.Location = Point(self._LEFT + _scale(16, _DPI_SCALE), _scale(4, _DPI_SCALE))
-            _dr.Controls.Add(_dl)
-            self._scroll.Controls.Add(_dr)
-            y += ALIGN_DESC_H + 1
-
-        _void1_left_val = getattr(os_, "void1_x_offset_left", 6.0)
-        y = self._num_row(y, "Void 1 X Offset Left (in)  [used by Set X Offset]",
-                          _void1_left_val, "_void1_x_offset_left")
-
-        # ── Panels WITHOUT openings ──────────────────────────────────────
-        y = self._section(y, "  No-Opening Panels  (applies when Minimize Unique is selected)")
-        _cur_nw = getattr(os_, "nonwindow_strategy", "largest")
-        _nw_rev = {"largest": "Minimize Total Panels", "standardise": "Identical (match standard W)"}
-        _cur_nw_lbl = _nw_rev.get(_cur_nw, "Minimize Total Panels")
-        y = self._radio_row(y, "No-Opening Panel Strategy",
-                            ["Minimize Total Panels", "Identical (match standard W)"],
-                            _cur_nw_lbl, "_rb_nw")
-
-        NW_DESC_H = self._ROW_H * 2 + _scale(4, _DPI_SCALE)
-        for _nwdesc in [
-            ("Minimize Total Panels: Edge and no-opening zones use the largest panel that fits. "
-             "These panels may be different widths from each other and from the window panels."),
-            ("Identical (match standard W): Use the same width W as the window panels in "
-             "edge/no-opening zones too, so the whole facade shares as few unique types as possible."),
-        ]:
-            _nwdr = self._make_row(y, CLR_ROW_ALT, NW_DESC_H)
-            _nwdl = Label()
-            _nwdl.Text      = _nwdesc
-            _nwdl.Font      = FNT_SMALL
-            _nwdl.ForeColor = Color.FromArgb(80, 80, 80)
-            _nwdl.AutoSize  = False
-            row_w3 = self._scroll.ClientSize.Width
-            if row_w3 < 100: row_w3 = self.ClientSize.Width - 20
-                
-            _nwdl.Size     = Size(max(row_w3 - _scale(30, _DPI_SCALE), _scale(400, _DPI_SCALE)),
-                                  NW_DESC_H - _scale(4, _DPI_SCALE))
-            _nwdl.Location = Point(self._LEFT + _scale(16, _DPI_SCALE), _scale(4, _DPI_SCALE))
-            _nwdr.Controls.Add(_nwdl)
-            self._scroll.Controls.Add(_nwdr)
-            y += NW_DESC_H + 1
 
         self._scroll.AutoScrollMinSize = Size(_scale(600, _DPI_SCALE), y + _scale(60, _DPI_SCALE))
 
@@ -956,22 +860,6 @@ class ConfigDialog(Form):
         os_.limit_panel_height_to_floor = ("Yes" in self._selected("_rb_floor_h"))
         os_.flexible_top_panel_allowance_in     = self._flt("_txt_flex_top", 24.0)
 
-        # Opening alignment strategy
-        _align_map = {
-            "Opening-Derived Width": "opening_derived",
-            "Center Openings":       "center",
-            "Set X Offset":          "set_x_offset",
-        }
-        os_.opening_alignment   = _align_map.get(self._selected("_rb_align"),
-                                                  "opening_derived")
-        os_.void1_x_offset_left = self._flt("_void1_x_offset_left", 6.0)
-
-        # No-opening panel strategy
-        _nw_map = {
-            "Minimize Total Panels":        "largest",
-            "Identical (match standard W)": "standardise",
-        }
-        os_.nonwindow_strategy = _nw_map.get(self._selected("_rb_nw"), "largest")
 
         self.DialogResult = DialogResult.OK
         self.Close()
