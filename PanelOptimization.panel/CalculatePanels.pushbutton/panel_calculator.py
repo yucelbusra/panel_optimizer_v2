@@ -3425,6 +3425,7 @@ def process_all_walls(walls_rows, openings_rows, output_dir,
                       door_clearances, window_clearances, storefront_clearances,
                       config=None, orientation="vertical", output_filename="optimized_panel_placement.csv",
                       force_mode=None):
+    print("PANEL_CALCULATOR_FILE: " + __file__)
     global ACTIVE_CONFIG, LAST_RUN_STATS
     if config is not None: ACTIVE_CONFIG = config
     elif ACTIVE_CONFIG is None:
@@ -3462,6 +3463,84 @@ def process_all_walls(walls_rows, openings_rows, output_dir,
     
     # Sort walls to process connected facades sequentially
     walls_rows.sort(key=lambda w: (w.get("FacadeId", ""), safe_float(w.get("wall_origin_x")), safe_float(w.get("wall_origin_y"))))
+
+    # --- BUTT CORNER RESOLVER ---
+    # Pre-pass, run once before any wall is placed. For every pair of walls
+    # that meet at a true 90-degree corner, decide ONE winner (full length,
+    # runs through the corner) and ONE loser (recedes by the WINNER's panel
+    # thickness). Without this, the per-wall loop below independently
+    # shortens EACH wall by its OWN thickness at every 90-degree neighbor,
+    # so neither wall ever runs through -- leaving a square notch at the
+    # corner (both walls receding) instead of a clean butt joint.
+    #
+    # Winner selection: a corner's choice affects each wall's resulting
+    # effective width, which is the dominant driver of the panel widths it
+    # will generate. As a proxy for "produces fewer unique panel types"
+    # without re-running full placement for every corner combination, we
+    # pick whichever assignment leaves both walls' resulting widths closer
+    # to widths already used elsewhere in the building. Ties fall back to
+    # the longer wall winning (the shorter run is more disposable to alter).
+    def _resolve_butt_corners(_walls_rows):
+        geoms = []
+        for _w in _walls_rows:
+            _wid = get_wall_id(_w)
+            _s = _parse_xyz(_w.get("Start(X,Y,Z)", ""))
+            _e = _parse_xyz(_w.get("End(X,Y,Z)", ""))
+            if not (_s and _e):
+                continue
+            _dx, _dy, _dz = _e[0]-_s[0], _e[1]-_s[1], _e[2]-_s[2]
+            _mag = math.sqrt(_dx*_dx + _dy*_dy + _dz*_dz)
+            if _mag < 1e-9:
+                continue
+            _dims = get_wall_dimensions(_w)
+            _width = _dims[0] if _dims else 0.0
+            _thick = safe_float(_w.get("panel_total_thickness_in"), 6.625)
+            geoms.append({"id": _wid, "start": _s, "end": _e,
+                          "dir": (_dx/_mag, _dy/_mag, _dz/_mag),
+                          "width": _width, "thick": _thick})
+
+        _all_widths = [g["width"] for g in geoms]
+
+        def _width_match_score(_w):
+            return sum(1 for _ow in _all_widths if abs(_ow - _w) < 0.5)
+
+        seen_pairs = set()
+        ext_lookup = {}
+
+        for _i, g in enumerate(geoms):
+            for h in geoms[_i + 1:]:
+                pair_key = tuple(sorted([g["id"], h["id"]]))
+                if pair_key in seen_pairs:
+                    continue
+                for g_end, g_pt in (("start", g["start"]), ("end", g["end"])):
+                    for h_end, h_pt in (("start", h["start"]), ("end", h["end"])):
+                        d = math.sqrt(sum((g_pt[k] - h_pt[k]) ** 2 for k in range(3)))
+                        if d >= 1.0:
+                            continue
+                        dot = sum(g["dir"][k] * h["dir"][k] for k in range(3))
+                        if abs(dot) >= 0.5:
+                            continue  # not a true 90-degree corner
+
+                        seen_pairs.add(pair_key)
+
+                        # Candidate A: g wins, h recedes by g's thickness
+                        scoreA = (_width_match_score(g["width"]) +
+                                  _width_match_score(h["width"] - g["thick"]))
+                        # Candidate B: h wins, g recedes by h's thickness
+                        scoreB = (_width_match_score(h["width"]) +
+                                  _width_match_score(g["width"] - h["thick"]))
+
+                        g_wins = scoreA > scoreB or (scoreA == scoreB and g["width"] >= h["width"])
+
+                        if g_wins:
+                            ext_lookup[(g["id"], g_end)] = 0.0
+                            ext_lookup[(h["id"], h_end)] = -g["thick"]
+                        else:
+                            ext_lookup[(h["id"], h_end)] = 0.0
+                            ext_lookup[(g["id"], g_end)] = -h["thick"]
+        return ext_lookup
+
+    _corner_ext_lookup = _resolve_butt_corners(walls_rows)
 
     for wall_row in walls_rows:
         wall_id = get_wall_id(wall_row)
@@ -3546,7 +3625,11 @@ def process_all_walls(walls_rows, openings_rows, output_dir,
                    math.sqrt((_start_xyz[0]-o_e[0])**2 + (_start_xyz[1]-o_e[1])**2 + (_start_xyz[2]-o_e[2])**2) < 1.0:
                     dot = _wall_geom["wall_dir_x"]*odir[0] + _wall_geom["wall_dir_y"]*odir[1] + _wall_geom["wall_dir_z"]*odir[2]
                     if abs(dot) < 0.5:
-                        _p_start_ext = -panel_thick_in # It's a 90-degree corner
+                        # 90-degree corner: use the pre-resolved winner/loser
+                        # assignment so only ONE wall recedes (by the OTHER's
+                        # thickness) instead of both walls shortening
+                        # themselves by their own thickness.
+                        _p_start_ext = _corner_ext_lookup.get((wall_id, "start"), -panel_thick_in)
                     elif abs(dot) > 0.8:
                         _p_start_ext = -(_spacing / 2.0) # It's a flat colinear facade connection
                 
@@ -3555,7 +3638,7 @@ def process_all_walls(walls_rows, openings_rows, output_dir,
                    math.sqrt((_end_xyz[0]-o_e[0])**2 + (_end_xyz[1]-o_e[1])**2 + (_end_xyz[2]-o_e[2])**2) < 1.0:
                     dot = _wall_geom["wall_dir_x"]*odir[0] + _wall_geom["wall_dir_y"]*odir[1] + _wall_geom["wall_dir_z"]*odir[2]
                     if abs(dot) < 0.5:
-                        _p_end_ext = -panel_thick_in # It's a 90-degree corner
+                        _p_end_ext = _corner_ext_lookup.get((wall_id, "end"), -panel_thick_in)
                     elif abs(dot) > 0.8:
                         _p_end_ext = -(_spacing / 2.0) # It's a flat colinear facade connection
 
@@ -3619,37 +3702,30 @@ def process_all_walls(walls_rows, openings_rows, output_dir,
                       wall_id, _y0, _y1, len(_band_recs), _with_cut) + Ansi.RESET)
             for _r in _band_recs: _r["y_in"] = round(_r["y_in"] + _y0, 4)
             panel_records.extend(_band_recs)
-        if str(orientation).lower() != 'horizontal':
-            # ---- [DIAG] opening pipeline stage 5: pre-align cutout accounting ----
-            _pre_cut = sum(1 for _r in panel_records if _r.get("cutouts_json"))
-            panel_records = _align_courses_to_piers(
-                panel_records, _ext_openings, _eff_wall_w, ACTIVE_CONFIG.panel_constraints)
-            _post_cut = sum(1 for _r in panel_records if _r.get("cutouts_json"))
-            _delta = _post_cut - _pre_cut
-            _tag = "OK" if _delta == 0 else ("LOST {}".format(-_delta) if _delta < 0 else "GAINED {}".format(_delta))
-            _color = Ansi.CYAN if _delta == 0 else Ansi.RED
-            print(_color + "  [DIAG wall={}] stage5 _align_courses_to_piers: "
-                  "cutouts before={} after={} ({})".format(
-                      wall_id, _pre_cut, _post_cut, _tag) + Ansi.RESET)
-        if str(orientation).lower() != 'horizontal':
-            # ---- [DIAG] opening pipeline stage 5: pre-align cutout accounting ----
-            _pre_cut = sum(1 for _r in panel_records if _r.get("cutouts_json"))
-            
-            panel_records = _align_courses_to_piers(
-                panel_records, _ext_openings, _eff_wall_w, ACTIVE_CONFIG.panel_constraints)
-            
-            # --- THE NEW PLUMB ALIGNER ---
-            panel_records = _plumb_align_vertical_seams(
-                panel_records, _ext_openings, ACTIVE_CONFIG.panel_constraints, tol=4.0)
 
-            _post_cut = sum(1 for _r in panel_records if _r.get("cutouts_json"))
-            _delta = _post_cut - _pre_cut
-            _tag = "OK" if _delta == 0 else ("LOST {}".format(-_delta) if _delta < 0 else "GAINED {}".format(_delta))
-            _color = Ansi.CYAN if _delta == 0 else Ansi.RED
-            print(_color + "  [DIAG wall={}] stage5 align & plumb: "
-                  "cutouts before={} after={} ({})".format(
-                      wall_id, _pre_cut, _post_cut, _tag) + Ansi.RESET)
-                      
+        # ---- [DIAG] opening pipeline stage 5: pier alignment + plumb seam align ----
+        # NOTE: previously gated behind `if str(orientation).lower() != 'horizontal':`
+        # which silently skipped this ENTIRE block (both _align_courses_to_piers and
+        # _plumb_align_vertical_seams) whenever orientation was 'horizontal'. Vertical
+        # seam misalignment across floor courses happens in horizontal-coursed
+        # facades too, so this now always runs regardless of orientation.
+        _pre_cut = sum(1 for _r in panel_records if _r.get("cutouts_json"))
+
+        panel_records = _align_courses_to_piers(
+            panel_records, _ext_openings, _eff_wall_w, ACTIVE_CONFIG.panel_constraints)
+
+        # --- THE PLUMB ALIGNER ---
+        panel_records = _plumb_align_vertical_seams(
+            panel_records, _ext_openings, ACTIVE_CONFIG.panel_constraints, tol=4.0)
+
+        _post_cut = sum(1 for _r in panel_records if _r.get("cutouts_json"))
+        _delta = _post_cut - _pre_cut
+        _tag = "OK" if _delta == 0 else ("LOST {}".format(-_delta) if _delta < 0 else "GAINED {}".format(_delta))
+        _color = Ansi.CYAN if _delta == 0 else Ansi.RED
+        print(_color + "  [DIAG wall={}] stage5 align & plumb: "
+              "cutouts before={} after={} ({})".format(
+                  wall_id, _pre_cut, _post_cut, _tag) + Ansi.RESET)
+
         for _idx, _r in enumerate(panel_records, start=1): _r["panel_name"] = "P{:02d}".format(_idx)
 
         # Shift x_in back to wall_origin coordinates

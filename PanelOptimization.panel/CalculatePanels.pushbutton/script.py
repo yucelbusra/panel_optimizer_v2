@@ -858,7 +858,7 @@ class ConfigDialog(Form):
 
         os_.horizontal_to_vertical_threshold_in = self._flt("_txt_swap_thresh", 143.0)
         os_.limit_panel_height_to_floor = ("Yes" in self._selected("_rb_floor_h"))
-        os_.flexible_top_panel_allowance_in     = self._flt("_txt_flex_top", 24.0)
+        os_.flexible_top_panel_allowance_in     = self._flt("_txt_flex_top", 30.0)
 
 
         self.DialogResult = DialogResult.OK
