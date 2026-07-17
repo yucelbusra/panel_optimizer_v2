@@ -24,6 +24,17 @@ class Ansi(object):
     MAGENTA = "\033[95m"
     RED = "\033[91m"
 
+# Set True to see the full per-wall / per-band diagnostic firehose (stage1-6,
+# GAP/UNIFY/ABSORB/CONSOLIDATE detail, etc.). Leave False to see only the
+# per-strategy tournament findings (np/nu per strategy, the winner, and the
+# final unique-panel-type table) plus any real errors/warnings, which always
+# print regardless of this flag.
+SHOW_DIAGNOSTICS = False
+
+def _diag(*args, **kwargs):
+    if SHOW_DIAGNOSTICS:
+        print(*args, **kwargs)
+
 # Global active configuration (used for orientation & constraints)
 ACTIVE_CONFIG = None
 LAST_RUN_STATS = {"np": 0, "nu": 0}  # building-wide counts from last process_all_walls
@@ -805,24 +816,27 @@ def fill_horizontal_courses(x0, x1, y0, y1, panels, panel_counter,
 
     y = y0
     for _ci in range(n):
+        # Equal-split the width across this course too (same idea as the
+        # course-height split above), instead of greedily maxing out the
+        # first panel and dumping whatever's left as a narrow leftover.
+        # A greedy leftover (e.g. 126" + 24") can end up TALLER than it is
+        # WIDE, which reads as a portrait/vertical sliver even though this
+        # function is supposed to produce horizontal panels.
+        m = max(1, int(math.ceil((W + sp) / (LONG_CAPPED + sp))))
+        panel_w = (W - (m - 1) * sp) / float(m)
+        while panel_w < minw and m > 1:
+            m -= 1
+            panel_w = (W - (m - 1) * sp) / float(m)
+        panel_w = round(panel_w, 6)
+
         x = x0
-        while x < x1 - 1e-6:
-            rem = x1 - x
-            if rem < minw:
-                row = [p for p in panels if abs(p.y - y) < 0.01 and p.x >= x0]
-                if row and (row[-1].w + sp + rem) <= LONG_CAPPED:
-                    row[-1].w = round(row[-1].w + sp + rem, 6)
-                    row[-1].cutouts = calculate_panel_cutouts(row[-1], all_openings)
-                break
-            pw = rem if rem <= LONG_CAPPED else LONG_CAPPED
-            if 0 < (rem - pw) < (minw + sp):
-                pw = rem - (minw + sp)
-            cand = Panel(round(x, 6), round(y, 6), round(pw, 6), round(course_h, 6),
+        for _pi in range(m):
+            cand = Panel(round(x, 6), round(y, 6), panel_w, round(course_h, 6),
                          "PH{:02d}".format(panel_counter))
             cand.cutouts = calculate_panel_cutouts(cand, all_openings)
             panels.append(cand)
             panel_counter += 1
-            x += pw + sp
+            x += panel_w + sp
         y += course_h + sp
     return panel_counter
 
@@ -1095,7 +1109,7 @@ def _accordion_seam_shifter(panels, openings, constraints, orientation):
                 right_n.cutouts  = calculate_panel_cutouts(right_n,  openings)
 
                 shifted += 1
-                print(Ansi.CYAN +
+                _diag(Ansi.CYAN +
                       "  [CONSOLIDATE] {} pulled {:+.2f}\" (cutout x_in -> {:.2f}\"); "
                       "L:{}.w={:.2f}\"  R:{}.w={:.2f}\"".format(
                         target_p.name, -delta, canon_x,
@@ -1103,7 +1117,7 @@ def _accordion_seam_shifter(panels, openings, constraints, orientation):
                         right_n.name, right_n.w) + Ansi.RESET)
 
     if shifted or skipped_edge or skipped_neighbor_cutout or skipped_neighbor_width:
-        print(Ansi.CYAN +
+        _diag(Ansi.CYAN +
               "  [CONSOLIDATE] Shifted {} panel(s). Skipped: "
               "edge={} neighbor-has-cutout={} neighbor-width={}".format(
                 shifted, skipped_edge,
@@ -1277,7 +1291,7 @@ def _absorb_narrow_fills(panels, openings, constraints, orientation):
 
     if absorbed > 0 or any(v > 0 for v in skip.values()):
         skipped_summary = " ".join("{}={}".format(k, v) for k, v in skip.items() if v > 0)
-        print(Ansi.CYAN + "  [ABSORB] Merged {} fill panel(s) into adjacent hosts. {}".format(
+        _diag(Ansi.CYAN + "  [ABSORB] Merged {} fill panel(s) into adjacent hosts. {}".format(
             absorbed, "Skipped: " + skipped_summary if skipped_summary else "") + Ansi.RESET)
 
     return panels
@@ -1460,7 +1474,7 @@ def _unify_pattern_runs(panels, openings, constraints, orientation):
             right_n.cutouts = calculate_panel_cutouts(right_n, openings)
 
             unified_runs += 1
-            print(Ansi.CYAN +
+            _diag(Ansi.CYAN +
                   "  [UNIFY] Run of {} panel(s) forced to W={:.3f}\" "
                   "(delta {:+.2f}\", split {:+.2f}\"/{:+.2f}\" L/R); "
                   "L:{}.w={:.2f}\"  R:{}.w={:.2f}\"".format(
@@ -1473,7 +1487,7 @@ def _unify_pattern_runs(panels, openings, constraints, orientation):
     if unified_runs or (skipped_no_neighbor + skipped_irregular_ops +
                         skipped_width_bounds + skipped_neighbor_cutout +
                         skipped_neighbor_bounds + skipped_seam_in_opening):
-        print(Ansi.CYAN +
+        _diag(Ansi.CYAN +
               "  [UNIFY] Unified {} run(s). Skipped: "
               "no-outer-neighbor={} irregular-openings={} "
               "target-width-oob={} neighbor-has-cutout={} "
@@ -2091,7 +2105,7 @@ def detect_repeating_opening_groups(openings, constraints):
 
                 if len(run) >= 2:
                     repeating.append(run)
-                    print(Ansi.CYAN + "  [PATTERN] Repeating group: {} opening(s) "
+                    _diag(Ansi.CYAN + "  [PATTERN] Repeating group: {} opening(s) "
                           "{}\"x{}\" y={:.1f}\" spaced {:.3f}\" c-to-c".format(
                           len(run), round(key[0], 3), round(key[1], 3),
                           round(run[0].y, 1), ref_spacing) + Ansi.RESET)
@@ -2403,18 +2417,18 @@ def process_wall(wall_id, wall_width, wall_height, openings):
     # base mode per pass. process_wall only ever runs ONE strategy. If a stray
     # tournament flag reaches here, fall through to the base branches below.
     if getattr(strategy, 'use_ga_optimizer', False):
-        print(Ansi.MAGENTA + "  [EXECUTE] Running Min Total + Unique..." + Ansi.RESET)
+        _diag(Ansi.MAGENTA + "  [EXECUTE] Running Min Total + Unique..." + Ansi.RESET)
         panels = _place_ga_optimized(wall_width, wall_height, openings, constraints, orientation, strategy)
         
     elif getattr(strategy, 'minimize_unique_panels', False):
-        print(Ansi.MAGENTA + "  [EXECUTE] Running Minimize Unique..." + Ansi.RESET)
+        _diag(Ansi.MAGENTA + "  [EXECUTE] Running Minimize Unique..." + Ansi.RESET)
         panels = _place_minimize_unique(wall_width, wall_height, openings, constraints, orientation, strategy)
         
     else:
         # =================================================================
         # FIX: The hard 'else' guarantees this runs if nothing else does
         # =================================================================
-        print(Ansi.MAGENTA + "  [EXECUTE] Running Minimize Total Panels..." + Ansi.RESET)
+        _diag(Ansi.MAGENTA + "  [EXECUTE] Running Minimize Total Panels..." + Ansi.RESET)
         panels = place_panels_sequential(wall_width, wall_height, openings, constraints, orientation)
 
     # Option 1: equalize drifted sibling panels at the source.
@@ -2454,7 +2468,7 @@ def process_wall(wall_id, wall_width, wall_height, openings):
             "cutouts_json": json.dumps(panel.cutouts) if getattr(panel, 'cutouts', None) else ""
         })
 
-    print(Ansi.GREEN + " Result: {} panels generated".format(len(panels)) + Ansi.RESET)
+    _diag(Ansi.GREEN + " Result: {} panels generated".format(len(panels)) + Ansi.RESET)
     return records
 
 def _place_minimize_unique(wall_width, wall_height, openings, constraints,
@@ -2516,7 +2530,7 @@ def _place_minimize_unique(wall_width, wall_height, openings, constraints,
     repeating_groups = detect_repeating_opening_groups(openings, constraints)
 
     if not repeating_groups:
-        print(Ansi.YELLOW + "  [PATTERN] No repeating groups found — "
+        _diag(Ansi.YELLOW + "  [PATTERN] No repeating groups found — "
               "using Minimize Total Panels fallback." + Ansi.RESET)
         return place_panels_sequential(wall_width, wall_height, openings, constraints, orientation)
 
@@ -2585,7 +2599,7 @@ def _place_minimize_unique(wall_width, wall_height, openings, constraints,
         if _intruders:
             _desc = ", ".join("{}@x={:.0f}".format(
                 getattr(_o, 'opening_type', '?'), _o.x) for _o in _intruders[:3])
-            print(Ansi.YELLOW + "  [ANCHOR-SKIP] Pattern zone {:.1f}\"..{:.1f}\": {} wider-than-host opening(s) ({}); greedy will handle.".format(
+            _diag(Ansi.YELLOW + "  [ANCHOR-SKIP] Pattern zone {:.1f}\"..{:.1f}\": {} wider-than-host opening(s) ({}); greedy will handle.".format(
                 zs_, ze_, len(_intruders), _desc) + Ansi.RESET)
             continue
         filtered_merged_groups.append([zs_, ze_, zone_ops_])
@@ -2631,7 +2645,7 @@ def _place_minimize_unique(wall_width, wall_height, openings, constraints,
         if _intruders:
             _desc = ", ".join("{}@x={:.0f}".format(
                 getattr(_o, 'opening_type', '?'), _o.x) for _o in _intruders[:3])
-            print(Ansi.YELLOW + "  [ANCHOR-SKIP] Pattern zone {:.1f}\"..{:.1f}\": {} wider-than-host opening(s) ({}); greedy will handle.".format(
+            _diag(Ansi.YELLOW + "  [ANCHOR-SKIP] Pattern zone {:.1f}\"..{:.1f}\": {} wider-than-host opening(s) ({}); greedy will handle.".format(
                 zs_, ze_, len(_intruders), _desc) + Ansi.RESET)
             continue
         filtered_merged_groups.append([zs_, ze_, zone_ops_])
@@ -2668,7 +2682,7 @@ def _place_minimize_unique(wall_width, wall_height, openings, constraints,
                 canonical_left = band_w - orig_canonical_left - primary_o.w
             else:
                 canonical_left = orig_canonical_left
-            print(Ansi.CYAN + "  [PATTERN] Mirrored LH/RH Twin Detected!" + Ansi.RESET)
+            _diag(Ansi.CYAN + "  [PATTERN] Mirrored LH/RH Twin Detected!" + Ansi.RESET)
         
             
         else:
@@ -3028,7 +3042,7 @@ def _place_minimize_unique(wall_width, wall_height, openings, constraints,
                     if _pb_ids.issubset(_pa_ids):
                         _removed.add(_idx_b)
         if _removed:
-            print(Ansi.YELLOW + "  [DEDUP] Removed {} fully-contained duplicate panel(s) "
+            _diag(Ansi.YELLOW + "  [DEDUP] Removed {} fully-contained duplicate panel(s) "
                   "from minimize-unique output.".format(len(_removed)) + Ansi.RESET)
         return [_p for _i, _p in enumerate(panel_list) if _i not in _removed]
 
@@ -3058,9 +3072,9 @@ def _place_minimize_unique(wall_width, wall_height, openings, constraints,
                 _gaps.append((round(_cursor, 2), round(wall_w, 2),
                               round(wall_w - _cursor, 2)))
             if _gaps:
-                print(Ansi.RED + "  [GAP] band y={:.2f} h={:.2f}:".format(y_key, h_key) + Ansi.RESET)
+                _diag(Ansi.RED + "  [GAP] band y={:.2f} h={:.2f}:".format(y_key, h_key) + Ansi.RESET)
                 for _s, _e, _w in _gaps:
-                    print(Ansi.RED + "        [{:.2f} .. {:.2f}]  ({:.2f}\" wide)".format(_s, _e, _w) + Ansi.RESET)
+                    _diag(Ansi.RED + "        [{:.2f} .. {:.2f}]  ({:.2f}\" wide)".format(_s, _e, _w) + Ansi.RESET)
 
     _report_gaps(welded_panels, wall_width)
 
@@ -3104,7 +3118,7 @@ def _place_minimize_unique(wall_width, wall_height, openings, constraints,
                         print(Ansi.RED + "  [AUDIT FAIL] OVERLAP DETECTED! {:.2f}\" collision between {} and {}.".format(abs(delta), p.name, next_p.name) + Ansi.RESET)
                         errors += 1
         if errors == 0:
-            print(Ansi.GREEN + "  [AUDIT PASS] Facade geometry is perfectly sealed." + Ansi.RESET)
+            _diag(Ansi.GREEN + "  [AUDIT PASS] Facade geometry is perfectly sealed." + Ansi.RESET)
 
     # ==========================================
     # 3. CALL THEM BOTH BEFORE RETURNING
@@ -3589,14 +3603,14 @@ def process_all_walls(walls_rows, openings_rows, output_dir,
         )
         # ---- [DIAG] opening pipeline stage 1: routing ----
         _wm_hosts = sorted(wall_map.get(str(wall_id), set())) if wall_map else []
-        print(Ansi.CYAN + "  [DIAG wall={}] stage1 get_wall_openings: {} opening(s)  "
+        _diag(Ansi.CYAN + "  [DIAG wall={}] stage1 get_wall_openings: {} opening(s)  "
               "wall_map_hosts={}".format(wall_id, len(openings), _wm_hosts or "(self only)") + Ansi.RESET)
         if openings:
             for _op in openings[:6]:
-                print(Ansi.CYAN + "    op id={} type={} x={:.1f} y={:.1f} w={:.1f} h={:.1f}"
+                _diag(Ansi.CYAN + "    op id={} type={} x={:.1f} y={:.1f} w={:.1f} h={:.1f}"
                       .format(_op.id, getattr(_op, 'type', '?'), _op.x, _op.y, _op.w, _op.h) + Ansi.RESET)
             if len(openings) > 6:
-                print(Ansi.CYAN + "    ... {} more".format(len(openings) - 6) + Ansi.RESET)
+                _diag(Ansi.CYAN + "    ... {} more".format(len(openings) - 6) + Ansi.RESET)
 
 
         # --- SEAM DETECTOR (True Corners & Colinear Facades) ---
@@ -3651,7 +3665,7 @@ def process_all_walls(walls_rows, openings_rows, output_dir,
         if _p_start_ext != 0.0 or _p_end_ext != 0.0:
             _oob_ct = sum(1 for _o in _ext_openings
                           if _o.x + _o.w <= 0 or _o.x >= _eff_wall_w)
-            print(Ansi.CYAN + "  [DIAG wall={}] stage2 corner shift: "
+            _diag(Ansi.CYAN + "  [DIAG wall={}] stage2 corner shift: "
                   "start_ext={:.2f} end_ext={:.2f} eff_w={:.2f} "
                   "openings out-of-wall={}".format(
                       wall_id, _p_start_ext, _p_end_ext, _eff_wall_w, _oob_ct) + Ansi.RESET)
@@ -3672,11 +3686,18 @@ def process_all_walls(walls_rows, openings_rows, output_dir,
             _bands = _compute_elevation_bands(_wall_h_in, _rel_elevs, _max_ph_in)
 
         panel_records = []
-        for _y0, _y1 in _bands:
+        _n_bands = len(_bands)
+        _band_gap_sp = float(getattr(ACTIVE_CONFIG.panel_constraints, "panel_spacing", 0.0) or 0.0)
+        for _bidx, (_y0, _y1) in enumerate(_bands):
             _band_h_in = _y1 - _y0
-            _band_ops  = _clip_openings_to_band(_ext_openings, _y0, _y1)
+            # Leave a panel_spacing reveal ABOVE every band except the last,
+            # so stacked floor courses get a real vertical gap instead of
+            # butting together with 0" between them.
+            if _bidx < _n_bands - 1:
+                _band_h_in = round(_band_h_in - _band_gap_sp, 4)
+            _band_ops  = _clip_openings_to_band(_ext_openings, _y0, _y0 + _band_h_in)
             # ---- [DIAG] opening pipeline stage 3: band clipping ----
-            print(Ansi.CYAN + "  [DIAG wall={}] stage3 band y=[{:.1f}, {:.1f}]: "
+            _diag(Ansi.CYAN + "  [DIAG wall={}] stage3 band y=[{:.1f}, {:.1f}]: "
                   "{} opening(s) survive clip".format(
                       wall_id, _y0, _y1, len(_band_ops)) + Ansi.RESET)
             
@@ -3697,7 +3718,7 @@ def process_all_walls(walls_rows, openings_rows, output_dir,
                 _band_recs = []
             # ---- [DIAG] opening pipeline stage 4: cutouts written per band ----
             _with_cut = sum(1 for _r in _band_recs if _r.get("cutouts_json"))
-            print(Ansi.CYAN + "  [DIAG wall={}] stage4 band y=[{:.1f}, {:.1f}]: "
+            _diag(Ansi.CYAN + "  [DIAG wall={}] stage4 band y=[{:.1f}, {:.1f}]: "
                   "{} panel(s) placed, {} with cutouts".format(
                       wall_id, _y0, _y1, len(_band_recs), _with_cut) + Ansi.RESET)
             for _r in _band_recs: _r["y_in"] = round(_r["y_in"] + _y0, 4)
@@ -3722,7 +3743,7 @@ def process_all_walls(walls_rows, openings_rows, output_dir,
         _delta = _post_cut - _pre_cut
         _tag = "OK" if _delta == 0 else ("LOST {}".format(-_delta) if _delta < 0 else "GAINED {}".format(_delta))
         _color = Ansi.CYAN if _delta == 0 else Ansi.RED
-        print(_color + "  [DIAG wall={}] stage5 align & plumb: "
+        _diag(_color + "  [DIAG wall={}] stage5 align & plumb: "
               "cutouts before={} after={} ({})".format(
                   wall_id, _pre_cut, _post_cut, _tag) + Ansi.RESET)
 
@@ -3756,10 +3777,10 @@ def process_all_walls(walls_rows, openings_rows, output_dir,
             if _was_reused:
                 _reused_here += 1
         _added_here = panel_library.unique_count() - _types_before
-        print(Ansi.GREEN + "  [PANEL SET] Wall {}: {} reused / {} new type(s)"
+        _diag(Ansi.GREEN + "  [PANEL SET] Wall {}: {} reused / {} new type(s)"
               .format(wall_id, _reused_here, _added_here) + Ansi.RESET)
         if _cut_lost_to_lib > 0:
-            print(Ansi.RED + "  [DIAG wall={}] stage6 panel_library.register STRIPPED "
+            _diag(Ansi.RED + "  [DIAG wall={}] stage6 panel_library.register STRIPPED "
                   "cutouts from {} panel(s)".format(wall_id, _cut_lost_to_lib) + Ansi.RESET)
 
         all_panel_records.extend(panel_records)
@@ -4234,7 +4255,7 @@ def global_normalize_records(records, tol=0.0625):
     differ by more than ``tol`` are kept as distinct types. Prefer building one
     live PanelLibrary across the run; this wrapper exists for old call sites.
     """
-    print(Ansi.CYAN + "  [TYPES] Labeling panels via live PanelLibrary "
+    _diag(Ansi.CYAN + "  [TYPES] Labeling panels via live PanelLibrary "
           "(strict matching, tol={0:g}\")...".format(tol) + Ansi.RESET)
     lib = PanelLibrary(match_tol=tol)
     for r in records:
