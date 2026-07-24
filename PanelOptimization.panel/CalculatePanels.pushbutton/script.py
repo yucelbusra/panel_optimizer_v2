@@ -137,6 +137,21 @@ def _safe_float(text, default):
     except Exception:
         return default
 
+def _fmt_len(inches):
+    """Format inches as a friendly feet-inches string: 636 -> 53', 102 -> 8'6\",
+    4 -> 4\", 6.625 -> 6.625\"."""
+    try:
+        v = float(inches)
+    except Exception:
+        return str(inches)
+    ft = int(v // 12)
+    rem = v - ft * 12
+    if ft and abs(rem) < 0.001:
+        return "{}'".format(ft)
+    if ft:
+        return "{}'{:g}\"".format(ft, rem)
+    return "{:g}\"".format(v)
+
 # Visual constants matching Revit's Family Types palette
 CLR_TITLE_BG   = Color.FromArgb(51,  51,  51)
 CLR_GROUP_BG   = Color.FromArgb(214, 222, 236)
@@ -178,8 +193,11 @@ INDENT  = 0     # rows dock to fill, no manual indent needed
 class ConfigDialog(Form):
     """Single Revit-style parameter grid - all config in one scrollable window."""
 
-    def __init__(self, config):
+    def __init__(self, config, trucking=None):
         self._cfg = config
+        self._trucking = dict(opt.DEFAULT_TRUCKING_SETTINGS)
+        if trucking:
+            self._trucking.update(trucking)
         self._init_scaled_geometry()
         self._build()
 
@@ -408,6 +426,82 @@ class ConfigDialog(Form):
         ]:
             y = self._clr_row(y, side, rv, pv, ra, pa)
 
+        # TAB 4: Trucking
+        tab_trk = TabPage("4. Trucking")
+        tab_trk.BackColor = CLR_BODY_BG
+        tab_trk.Font = FNT_NORMAL
+        scroll_trk = ScrollableControl()
+        scroll_trk.Dock = DockStyle.Fill
+        scroll_trk.AutoScroll = True
+        tab_trk.Controls.Add(scroll_trk)
+        self._tabs.TabPages.Add(tab_trk)
+
+        self._scroll = scroll_trk
+        trk = self._trucking
+        y = 10
+        y = self._section(y, "Truck & Load Geometry (accepts 53', 8'6\", 1' 3\", or plain inches)")
+        y = self._text_row(y, "Truck Length",
+                           _fmt_len(trk.get("truck_length_in", 636.0)), "_trk_len")
+        y = self._text_row(y, "Truck Width",
+                           _fmt_len(trk.get("truck_width_in", 102.0)), "_trk_wid")
+        y = self._text_row(y, "Max Stack Height (incl. dunnage)",
+                           _fmt_len(trk.get("max_stack_height_in", 102.0)), "_trk_stack")
+        y = self._text_row(y, "Dunnage Height",
+                           _fmt_len(trk.get("dunnage_height_in", 4.0)), "_trk_dun")
+        y = self._text_row(y, "Gap Between Panels (2 per row)",
+                           _fmt_len(trk.get("two_panel_gap_in", 6.0)), "_trk_gap2")
+        y = self._text_row(y, "Gap Between Panels (3 per row)",
+                           _fmt_len(trk.get("three_panel_gap_in", 15.0)), "_trk_gap3")
+        y = self._text_row(y, "Overhang Length Limit (end of truck)",
+                           _fmt_len(trk.get("overhang_length_in", 0.0)), "_trk_ovl")
+        y = self._text_row(y, "Overhang Width Limit (each side)",
+                           _fmt_len(trk.get("overhang_width_in", 0.0)), "_trk_ovw")
+        y = self._text_row(y, "Panel Thickness",
+                           _fmt_len(trk.get("panel_thickness_in", 6.625)), "_trk_thick")
+
+        y = self._section(y, "Sequencing & Site Logistics")
+        y = self._text_row(y, "Trucks On Site (simultaneously)",
+                           str(int(trk.get("trucks_on_site", 2))), "_trk_count")
+        _cur_pat = ("Column-by-column"
+                    if str(trk.get("install_pattern", "spiral")).lower() == "column"
+                    else "Spiral (course-by-course)")
+        y = self._radio_row(y, "Install Pattern",
+                            ["Spiral (course-by-course)", "Column-by-column"],
+                            _cur_pat, "_trk_pattern")
+        _cur_fac = str(trk.get("start_facade", "north")).capitalize()
+        if _cur_fac not in ("North", "East", "South", "West"):
+            _cur_fac = "North"
+        y = self._radio_row(y, "Start Facade",
+                            ["North", "East", "South", "West"],
+                            _cur_fac, "_trk_facade")
+        _cur_rot = ("Clockwise"
+                    if str(trk.get("rotation", "ccw")).lower() == "cw"
+                    else "Counter-Clockwise")
+        y = self._radio_row(y, "Rotation",
+                            ["Counter-Clockwise", "Clockwise"],
+                            _cur_rot, "_trk_rot")
+
+        trk_desc = (
+            "Rules: panels ride flat, longer side along the truck. A row holds 1-3 panels end-to-end;\n"
+            "row total (panel lengths + gaps) must fit Truck Length + Overhang Length Limit. Panel's\n"
+            "across-truck side must fit Truck Width + 2 x Overhang Width Limit, else flagged OVERSIZE.\n"
+            "Stacks: dunnage below the bottom layer and between layers; stack total <= Max Stack Height.\n"
+            "Spiral: complete the bottom course around the building, then the next course up, etc.\n"
+            "Column: full vertical stack at each slot before moving sideways along the wall.\n"
+            "Compass (plan view): South = left, North = right, East = front, West = back.\n"
+            "First-installed panel is loaded at the TOP of Truck 1. Output: trucking_plan.csv + layout txt."
+        )
+        trk_h = _scale(110, s)
+        trk_row = self._make_row(y, CLR_BODY_BG, trk_h)
+        trk_lbl = Label()
+        trk_lbl.Text = trk_desc
+        trk_lbl.Font = FNT_SMALL
+        trk_lbl.ForeColor = Color.FromArgb(80, 80, 80)
+        trk_lbl.Location = Point(self._LEFT + _scale(16, s), 0)
+        trk_lbl.Size = Size(_scale(720, s), trk_h)
+        trk_row.Controls.Add(trk_lbl)
+        self._scroll.Controls.Add(trk_row)
+        y += trk_h + 1
 
 
     def _reposition_buttons(self, s, e):
@@ -860,15 +954,47 @@ class ConfigDialog(Form):
         os_.limit_panel_height_to_floor = ("Yes" in self._selected("_rb_floor_h"))
         os_.flexible_top_panel_allowance_in     = self._flt("_txt_flex_top", 30.0)
 
+        # --- Trucking tab commit (kept OUT of the optimizer config on purpose) ---
+        trk = self._trucking
+        P = opt.parse_length_to_inches
+        trk["truck_length_in"]     = P(self._trk_len.Text,   636.0)
+        trk["truck_width_in"]      = P(self._trk_wid.Text,   102.0)
+        trk["max_stack_height_in"] = P(self._trk_stack.Text, 102.0)
+        trk["dunnage_height_in"]   = P(self._trk_dun.Text,   4.0)
+        trk["two_panel_gap_in"]    = P(self._trk_gap2.Text,  6.0)
+        trk["three_panel_gap_in"]  = P(self._trk_gap3.Text,  15.0)
+        trk["overhang_length_in"]  = P(self._trk_ovl.Text,   0.0)
+        trk["overhang_width_in"]   = P(self._trk_ovw.Text,   0.0)
+        trk["panel_thickness_in"]  = P(self._trk_thick.Text, 6.625)
+        try:
+            trk["trucks_on_site"] = max(1, int(float(self._trk_count.Text.strip())))
+        except Exception:
+            trk["trucks_on_site"] = 2
+        trk["install_pattern"] = ("column"
+            if "Column" in self._selected("_trk_pattern") else "spiral")
+        trk["start_facade"] = self._selected("_trk_facade").lower()
+        trk["rotation"] = ("cw"
+            if "Clockwise" == self._selected("_trk_rot") else "ccw")
+        trk.pop("first_panel_to_install", None)  # retired setting
+
+        trk_errors = []
+        if trk["truck_length_in"] <= 0: trk_errors.append("Truck Length must be > 0.")
+        if trk["truck_width_in"]  <= 0: trk_errors.append("Truck Width must be > 0.")
+        if trk["max_stack_height_in"] <= trk["dunnage_height_in"] + trk["panel_thickness_in"]:
+            trk_errors.append("Max Stack Height must exceed dunnage + one panel thickness.")
+        if trk_errors:
+            MessageBox.Show("\n".join(trk_errors), "Trucking Validation",
+                            MessageBoxButtons.OK, MessageBoxIcon.Warning)
+            return
 
         self.DialogResult = DialogResult.OK
         self.Close()
 
-def show_config_dialog(config):
-    form = ConfigDialog(config) 
+def show_config_dialog(config, trucking=None):
+    form = ConfigDialog(config, trucking)
     if form.ShowDialog() == DialogResult.OK:
-        return True
-    return False
+        return form._trucking
+    return None
 
 
 # =================
@@ -914,11 +1040,32 @@ def main():
     else:
         config = presets["vertical"]
 
+    # 2b) Load trucking settings (persisted separately from the optimizer config)
+    trucking_file = os.path.join(input_dir, "trucking_config.json")
+    trucking = None
+    if os.path.exists(trucking_file):
+        try:
+            import json as _json
+            with open(trucking_file, "r") as _tf:
+                trucking = _json.load(_tf)
+            print("[TRUCK] Loaded settings from: {}".format(trucking_file))
+        except Exception as ex:
+            print("[TRUCK] Failed to load settings ({}), using defaults.".format(ex))
+
     # 3) Show the single unified dialog
-    if not show_config_dialog(config):
+    trucking = show_config_dialog(config, trucking)
+    if trucking is None:
         MessageBox.Show("Operation canceled.", "Panel Optimizer",
                         MessageBoxButtons.OK, MessageBoxIcon.Information)
         return
+
+    # persist trucking settings for next run
+    try:
+        import json as _json
+        with open(trucking_file, "w") as _tf:
+            _json.dump(trucking, _tf, indent=2)
+    except Exception as ex:
+        print("[TRUCK] Could not save settings: {}".format(ex))
 
     orientation     = config.optimization_strategy.panel_orientation
     panel_spacing   = config.panel_constraints.panel_spacing
@@ -961,11 +1108,23 @@ def main():
     if config_path:
         print("Configuration saved to: {}".format(config_path))
 
+    # 6b) Trucking plan (additional output; failure here never blocks the run)
+    trucking_path = None
+    if panels_path and os.path.exists(panels_path):
+        try:
+            trucking_path = opt.generate_trucking_plan(
+                panels_path, trucking,
+                os.path.join(output_dir, "trucking_plan.csv"))
+        except Exception as ex:
+            print("[TRUCK ERROR] {}".format(ex))
+
     # 7) Done message
     if panels_path and os.path.exists(panels_path):
+        _trk_line = ("\nTrucking plan: trucking_plan.csv" if trucking_path
+                     else "\nTrucking plan: FAILED (see console)")
         MessageBox.Show(
-            "Optimization complete.\n\nPanel Type: {0}\nSpacing: {1}\"\n\nExported panels to:\n{2}".format(
-                panel_type_name, panel_spacing, output_dir),
+            "Optimization complete.\n\nPanel Type: {0}\nSpacing: {1}\"{2}\n\nExported panels to:\n{3}".format(
+                panel_type_name, panel_spacing, _trk_line, output_dir),
             "Panel Optimizer", MessageBoxButtons.OK, MessageBoxIcon.Information)
     else:
         MessageBox.Show(

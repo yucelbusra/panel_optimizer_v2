@@ -5007,3 +5007,444 @@ if __name__ == "__main__":
     # Do NOT run automatically inside pyRevit.
     # Only executes if someone manually runs calculator.py from command line.
     main()
+
+# =============================================================================
+# SECTION: TRUCKING OPTIMIZATION  (pure addition -- does not touch the optimizer)
+# =============================================================================
+# Takes the finished optimized_panel_placement.csv and produces:
+#   1) trucking_plan.csv   -- one row per panel: install seq, truck, layer, slot,
+#                             physical load order.
+#   2) trucking_layout.txt -- human-readable stack layout for EACH truck (every
+#                             layer top-to-bottom with panel names, lengths, row
+#                             usage) plus the TOTAL NUMBER OF TRUCKS NEEDED.
+#
+# Install order rule (isolated in _trk_install_sequence so it can be swapped):
+#   install_pattern:
+#     "spiral" (default) -- complete the ENTIRE BOTTOM COURSE around the
+#         building in the chosen rotation, then the next course up, etc.
+#         (practical for multistory: one lift elevation at a time)
+#     "column" -- work around the building wall by wall; at each horizontal
+#         slot install the full vertical stack bottom-to-top before moving on.
+#   start_facade: "north" / "east" / "south" / "west" -- which facade the
+#         sequence begins on, resolved from the panels' exterior normals.
+#         Compass convention (per project plan view): South = left (-X),
+#         North = right (+X), East = front (-Y), West = back (+Y).
+#   rotation: "ccw" (default) or "cw" -- direction of travel around the
+#         building.
+#
+# Truck model (v1 greedy packer, isolated in _trk_pack_trucks):
+#   - Panels ride FLAT, longer dimension along the truck length.
+#   - A "row" (layer) holds 1-3 panels end-to-end:
+#       2 panels -> one gap of two_panel_gap_in between them
+#       3 panels -> two gaps of three_panel_gap_in each
+#     sum(panel lengths) + gaps <= truck_length_in + overhang_length_in
+#   - Panel across-truck dimension <= truck_width_in + 2 * overhang_width_in
+#     (otherwise flagged OVERSIZE and left off the trucks).
+#   - Layers stack with dunnage_height_in under the bottom layer and between
+#     layers: total = n*dunnage + sum(thickness) <= max_stack_height_in.
+#   - trucks_on_site trucks are "open" simultaneously; installation can pull
+#     from any open truck, but within each truck earlier-install panels must
+#     sit ABOVE later ones (layers are built top-first here; physical load
+#     order per truck is the reverse).
+
+DEFAULT_TRUCKING_SETTINGS = {
+    "truck_length_in":        636.0,   # 53'
+    "truck_width_in":         102.0,   # 8'6"
+    "max_stack_height_in":    102.0,
+    "dunnage_height_in":      4.0,
+    "two_panel_gap_in":       6.0,
+    "three_panel_gap_in":     15.0,    # 1'3"
+    "overhang_length_in":     0.0,
+    "overhang_width_in":      0.0,     # per side
+    "trucks_on_site":         2,
+    "install_pattern":        "spiral",   # "spiral" | "column"
+    "start_facade":           "north",    # "north"|"east"|"south"|"west"
+    "rotation":               "ccw",      # "ccw" | "cw"
+    "panel_thickness_in":     6.625,
+}
+
+def parse_length_to_inches(text, default):
+    """Parse '53'', '8'6"', '1' 3"', '4"', or plain inches into float inches."""
+    try:
+        s = str(text).strip().replace('\u2019', "'").replace('\u201d', '"')
+        if not s:
+            return default
+        s = s.replace(" ", "")
+        feet, inches = 0.0, 0.0
+        if "'" in s:
+            ft_part, rest = s.split("'", 1)
+            feet = float(ft_part) if ft_part else 0.0
+            rest = rest.replace('"', "")
+            inches = float(rest) if rest else 0.0
+        else:
+            inches = float(s.replace('"', ""))
+        return feet * 12.0 + inches
+    except Exception:
+        return default
+
+def _trk_fmt_ftin(inches):
+    """96.0 -> 8'-0\"  |  102.5 -> 8'-6.5\"  |  6.6 -> 6.6\" """
+    ft = int(inches // 12)
+    rem = inches - ft * 12
+    if ft:
+        return "{0}'-{1:g}\"".format(ft, round(rem, 2))
+    return "{0:g}\"".format(round(inches, 2))
+
+# Compass convention per project plan view (see UI note):
+#   South = left (-X) | North = right (+X) | East = front (-Y) | West = back (+Y)
+_TRK_FACADE_NORMALS = {
+    "north": ( 1.0,  0.0),
+    "south": (-1.0,  0.0),
+    "east":  ( 0.0, -1.0),
+    "west":  ( 0.0,  1.0),
+}
+
+def _trk_install_sequence(rows, st):
+    """Order panel rows for installation per st["install_pattern"],
+    st["start_facade"], and st["rotation"]. Returns the same row dicts,
+    annotated with _install_seq (1-based).
+
+    spiral: complete each course around the whole building (bottom course
+            first), traveling in the chosen rotation, starting on the wall
+            whose exterior normal best matches the chosen facade.
+    column: previous behavior -- walls in rotation order from the start
+            facade; within each wall, each horizontal slot's full vertical
+            stack bottom-to-top before moving sideways."""
+    import math as _m
+
+    pattern  = str(st.get("install_pattern", "spiral")).strip().lower()
+    facade   = str(st.get("start_facade", "north")).strip().lower()
+    rotation = str(st.get("rotation", "ccw")).strip().lower()
+    ccw      = (rotation != "cw")
+    fvec     = _TRK_FACADE_NORMALS.get(facade, _TRK_FACADE_NORMALS["north"])
+
+    # global centroid of each panel (inches; wall_origin_* are in feet)
+    for r in rows:
+        ox = safe_float(r.get("wall_origin_x")) * 12.0
+        oy = safe_float(r.get("wall_origin_y")) * 12.0
+        dx = safe_float(r.get("wall_dir_x"))
+        dy = safe_float(r.get("wall_dir_y"))
+        mid = safe_float(r.get("x_in")) + safe_float(r.get("width_in")) / 2.0
+        r["_gx"] = ox + dx * mid
+        r["_gy"] = oy + dy * mid
+
+    cx = sum(r["_gx"] for r in rows) / float(len(rows))
+    cy = sum(r["_gy"] for r in rows) / float(len(rows))
+
+    # group by wall; angular position + mean exterior normal of each wall
+    walls = {}
+    for r in rows:
+        walls.setdefault(r.get("wall_id", ""), []).append(r)
+    wall_ang, wall_nrm, wall_cen = {}, {}, {}
+    for wid, wrows in walls.items():
+        mx = sum(w["_gx"] for w in wrows) / float(len(wrows))
+        my = sum(w["_gy"] for w in wrows) / float(len(wrows))
+        wall_cen[wid] = (mx, my)
+        wall_ang[wid] = _m.atan2(my - cy, mx - cx)
+        nx = sum(safe_float(w.get("wall_normal_x")) for w in wrows) / float(len(wrows))
+        ny = sum(safe_float(w.get("wall_normal_y")) for w in wrows) / float(len(wrows))
+        nm = _m.sqrt(nx * nx + ny * ny)
+        if nm > 1e-9:
+            wall_nrm[wid] = (nx / nm, ny / nm)
+        else:
+            # normals missing in CSV -> fall back to radial direction
+            rx, ry = mx - cx, my - cy
+            rm = _m.sqrt(rx * rx + ry * ry) or 1.0
+            wall_nrm[wid] = (rx / rm, ry / rm)
+
+    # start wall = best match between exterior normal and requested facade;
+    # tie-break: the wall farthest out in that compass direction
+    def facade_score(wid):
+        n = wall_nrm[wid]
+        c = wall_cen[wid]
+        return (n[0] * fvec[0] + n[1] * fvec[1],
+                c[0] * fvec[0] + c[1] * fvec[1])
+    start_wid = max(walls.keys(), key=facade_score)
+
+    a0 = wall_ang[start_wid]
+    TWO_PI = 2.0 * _m.pi
+
+    def wall_key(wid):
+        d = (wall_ang[wid] - a0) if ccw else (a0 - wall_ang[wid])
+        return d % TWO_PI
+    wall_order = sorted(walls.keys(), key=wall_key)
+
+    def travel_slot(r, wid):
+        """Position of the panel along its wall in the direction of travel."""
+        a = wall_ang[wid]
+        tx, ty = (-_m.sin(a), _m.cos(a)) if ccw else (_m.sin(a), -_m.cos(a))
+        d = walls[wid][0]
+        fwd = (safe_float(d.get("wall_dir_x")) * tx +
+               safe_float(d.get("wall_dir_y")) * ty) >= 0.0
+        xr = safe_float(r.get("x_in"))
+        return xr if fwd else -xr
+
+    ordered = []
+    if pattern == "column":
+        for wid in wall_order:
+            def in_wall_key(r, _wid=wid):
+                return (round(travel_slot(r, _wid), 0),
+                        safe_float(r.get("y_in")))
+            ordered.extend(sorted(walls[wid], key=in_wall_key))
+    else:
+        # spiral: cluster y_in into building-wide courses (12" tolerance --
+        # courses are level-aligned by the optimizer, so clusters are clean)
+        ys = sorted(set(round(safe_float(r.get("y_in")), 1) for r in rows))
+        clusters = []
+        for y in ys:
+            if clusters and y - clusters[-1][-1] <= 12.0:
+                clusters[-1].append(y)
+            else:
+                clusters.append([y])
+        course_of = {}
+        for ci, cl in enumerate(clusters):
+            for y in cl:
+                course_of[y] = ci
+        n_courses = len(clusters)
+        for ci in range(n_courses):
+            for wid in wall_order:
+                course_rows = [r for r in walls[wid]
+                               if course_of[round(safe_float(r.get("y_in")), 1)] == ci]
+                course_rows.sort(key=lambda r, _wid=wid: (
+                    round(travel_slot(r, _wid), 0),
+                    safe_float(r.get("y_in"))))
+                ordered.extend(course_rows)
+
+    for i, r in enumerate(ordered):
+        r["_install_seq"] = i + 1
+    print(Ansi.CYAN + "  [TRUCK] Sequence: {0}, start facade {1} (wall {2}), "
+          "{3}".format("spiral (course-by-course)" if pattern != "column"
+                       else "column-by-column",
+                       facade.upper(), start_wid,
+                       "CCW" if ccw else "CW") + Ansi.RESET)
+    return ordered
+
+def _trk_pack_trucks(seq_rows, st):
+    """Greedy packer. Processes panels in INSTALL order and builds each truck's
+    layer list TOP-FIRST (layers[0] = top of stack), so earlier-install panels
+    always sit above later ones in the same truck. Returns (trucks, oversize)
+    where trucks is a list of dicts {no, layers:[[row,..],..], height}."""
+    L_max  = st["truck_length_in"] + st["overhang_length_in"]
+    W_max  = st["truck_width_in"] + 2.0 * st["overhang_width_in"]
+    H_max  = st["max_stack_height_in"]
+    dun    = st["dunnage_height_in"]
+    gap2   = st["two_panel_gap_in"]
+    gap3   = st["three_panel_gap_in"]
+    thick  = st["panel_thickness_in"]
+    K      = max(1, int(st["trucks_on_site"]))
+
+    def layer_len(panels_in_layer):
+        n = len(panels_in_layer)
+        total = sum(p["_lay_len"] for p in panels_in_layer)
+        if n == 2:   total += gap2
+        elif n == 3: total += 2.0 * gap3
+        return total
+
+    trucks, open_trucks, oversize = [], [], []
+    next_no = [1]
+
+    def new_truck():
+        t = {"no": next_no[0], "layers": [], "height": 0.0}
+        next_no[0] += 1
+        trucks.append(t)
+        open_trucks.append(t)
+        return t
+
+    for r in seq_rows:
+        w = safe_float(r.get("width_in"))
+        h = safe_float(r.get("height_in"))
+        r["_lay_len"], r["_lay_across"] = max(w, h), min(w, h)
+        if r["_lay_across"] > W_max or r["_lay_len"] > L_max:
+            r["_truck"] = "OVERSIZE"
+            oversize.append(r)
+            continue
+
+        placed = False
+        # 1) try to extend the CURRENT (lowest, still-being-built) layer
+        for t in open_trucks:
+            if t["layers"]:
+                lay = t["layers"][-1]
+                if len(lay) < 3 and layer_len(lay + [r]) <= L_max:
+                    lay.append(r)
+                    placed = True
+                    break
+        # 2) else start a new layer (one dunnage + one thickness taller)
+        if not placed:
+            for t in open_trucks:
+                if t["height"] + dun + thick <= H_max:
+                    t["layers"].append([r])
+                    t["height"] += dun + thick
+                    placed = True
+                    break
+        # 3) else bring in a fresh truck (dispatch the oldest if K on site)
+        if not placed:
+            if len(open_trucks) >= K:
+                open_trucks.pop(0)
+            t = new_truck()
+            t["layers"].append([r])
+            t["height"] = dun + thick
+        # remember assignment
+        for t in trucks:
+            for lay in t["layers"]:
+                if r in lay:
+                    r["_truck"] = t["no"]
+    return trucks, oversize
+
+def _trk_write_layout_txt(path, trucks, oversize, seq_len, st):
+    """Human-readable per-truck stack layout + total trucks needed."""
+    L_max = st["truck_length_in"] + st["overhang_length_in"]
+
+    def layer_len(lay):
+        n = len(lay)
+        total = sum(p["_lay_len"] for p in lay)
+        if n == 2:   total += st["two_panel_gap_in"]
+        elif n == 3: total += 2.0 * st["three_panel_gap_in"]
+        return total
+
+    lines = []
+    lines.append("=" * 78)
+    lines.append("TRUCKING PLAN")
+    lines.append("=" * 78)
+    lines.append("TOTAL TRUCKS NEEDED: {0}".format(len(trucks)))
+    if oversize:
+        lines.append("OVERSIZE (special transport, not on trucks): {0} panel(s)"
+                     .format(len(oversize)))
+    lines.append("Panels loaded: {0} of {1}".format(seq_len - len(oversize), seq_len))
+    lines.append("")
+    lines.append("Settings: truck {0} x {1} | max stack {2} | dunnage {3} | "
+                 "gaps 2-up {4} / 3-up {5} | overhang L {6} / W {7} per side | "
+                 "panel thickness {8}".format(
+        _trk_fmt_ftin(st["truck_length_in"]), _trk_fmt_ftin(st["truck_width_in"]),
+        _trk_fmt_ftin(st["max_stack_height_in"]), _trk_fmt_ftin(st["dunnage_height_in"]),
+        _trk_fmt_ftin(st["two_panel_gap_in"]), _trk_fmt_ftin(st["three_panel_gap_in"]),
+        _trk_fmt_ftin(st["overhang_length_in"]), _trk_fmt_ftin(st["overhang_width_in"]),
+        _trk_fmt_ftin(st["panel_thickness_in"])))
+    lines.append("Sequence: {0} | start facade: {1} | rotation: {2}".format(
+        "spiral (course-by-course, bottom first)"
+        if str(st.get("install_pattern", "spiral")).lower() != "column"
+        else "column-by-column",
+        str(st.get("start_facade", "north")).upper(),
+        "CW" if str(st.get("rotation", "ccw")).lower() == "cw" else "CCW"))
+    lines.append("Rule: install order runs TOP-DOWN in each stack; physical "
+                 "loading is the reverse (bottom layer first).")
+    lines.append("")
+
+    for t in trucks:
+        n_p = sum(len(l) for l in t["layers"])
+        n_lay = len(t["layers"])
+        lines.append("-" * 78)
+        lines.append("TRUCK {0}   ({1} layer(s), {2} panel(s), stack height "
+                     "{3} / {4})".format(
+            t["no"], n_lay, n_p, _trk_fmt_ftin(t["height"]),
+            _trk_fmt_ftin(st["max_stack_height_in"])))
+        for li, lay in enumerate(t["layers"]):
+            tag = "TOP   " if li == 0 else ("BOTTOM" if li == n_lay - 1 else "      ")
+            cells = "  |  ".join(
+                "{0} ({1} x {2}) inst#{3}".format(
+                    p.get("panel_name", "?"),
+                    _trk_fmt_ftin(p["_lay_len"]), _trk_fmt_ftin(p["_lay_across"]),
+                    p.get("_install_seq", "?"))
+                for p in lay)
+            used = layer_len(lay)
+            lines.append("  Layer {0:>2} {1} : {2}".format(li + 1, tag, cells))
+            lines.append("             row length {0} / {1}  ({2:.0f}% used)".format(
+                _trk_fmt_ftin(used), _trk_fmt_ftin(L_max),
+                100.0 * used / L_max if L_max else 0.0))
+        lines.append("  Load order: Layer {0} (BOTTOM) first -> Layer 1 (TOP) last."
+                     .format(n_lay))
+    if oversize:
+        lines.append("-" * 78)
+        lines.append("OVERSIZE PANELS (exceed truck envelope; arrange special "
+                     "transport):")
+        for p in oversize:
+            lines.append("  {0}  ({1} x {2})  inst#{3}".format(
+                p.get("panel_name", "?"), _trk_fmt_ftin(p["_lay_len"]),
+                _trk_fmt_ftin(p["_lay_across"]), p.get("_install_seq", "?")))
+    lines.append("=" * 78)
+
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    return path
+
+def generate_trucking_plan(panels_csv_path, settings=None, output_path=None):
+    """Read optimized_panel_placement.csv, compute the install sequence and the
+    truck loading plan. Writes trucking_plan.csv (per-panel) AND
+    trucking_layout.txt (per-truck stack layout + total trucks needed) next to
+    it (or beside output_path). Returns the csv output path, or None if nothing
+    to do. Pure addition: does not modify the placement CSV or optimizer state."""
+    import csv as _csv, os as _os
+
+    st = dict(DEFAULT_TRUCKING_SETTINGS)
+    if settings:
+        st.update(settings)
+
+    with open(panels_csv_path, "r") as f:
+        rows = [dict(r) for r in _csv.DictReader(f)]
+    if not rows:
+        print(Ansi.YELLOW + "  [TRUCK] No panels in {}; skipping trucking plan."
+              .format(panels_csv_path) + Ansi.RESET)
+        return None
+
+    seq = _trk_install_sequence(rows, st)
+    trucks, oversize = _trk_pack_trucks(seq, st)
+
+    if output_path is None:
+        output_path = _os.path.join(_os.path.dirname(panels_csv_path),
+                                    "trucking_plan.csv")
+    layout_path = _os.path.join(_os.path.dirname(output_path),
+                                "trucking_layout.txt")
+
+    # per-truck physical load order = bottom layer first = reversed layers
+    load_order = {}
+    for t in trucks:
+        n_lay, order = len(t["layers"]), 1
+        for li in range(n_lay - 1, -1, -1):      # bottom (last) first
+            for r in t["layers"][li]:
+                load_order[id(r)] = order
+                order += 1
+
+    _f = open(output_path, "wb") if _sys_is_py2() else open(output_path, "w")
+    try:
+        wtr = _csv.writer(_f, lineterminator="\n")
+        wtr.writerow(["install_seq", "panel_name", "panel_type", "wall_id",
+                      "width_in", "height_in", "truck_no",
+                      "layer_from_top", "slot_in_layer",
+                      "truck_load_order", "note"])
+        for r in seq:
+            tno = r.get("_truck", "")
+            li_ft, slot = "", ""
+            if tno != "OVERSIZE" and tno != "":
+                for t in trucks:
+                    if t["no"] == tno:
+                        for li, lay in enumerate(t["layers"]):
+                            if r in lay:
+                                li_ft, slot = li + 1, lay.index(r) + 1
+                                break
+                        break
+            note = ("exceeds truck envelope -- special transport"
+                    if tno == "OVERSIZE" else "")
+            wtr.writerow([r["_install_seq"], r.get("panel_name", ""),
+                          r.get("panel_type", ""), r.get("wall_id", ""),
+                          r.get("width_in", ""), r.get("height_in", ""),
+                          tno, li_ft, slot, load_order.get(id(r), ""), note])
+    finally:
+        _f.close()
+
+    _trk_write_layout_txt(layout_path, trucks, oversize, len(seq), st)
+
+    print(Ansi.GREEN + "  [TRUCK] TOTAL TRUCKS NEEDED: {0}   ({1} panel(s) "
+          "loaded, {2} oversize)".format(len(trucks), len(seq) - len(oversize),
+                                         len(oversize)) + Ansi.RESET)
+    print(Ansi.GREEN + "  [TRUCK] Plan:   {0}".format(output_path) + Ansi.RESET)
+    print(Ansi.GREEN + "  [TRUCK] Layout: {0}".format(layout_path) + Ansi.RESET)
+    for t in trucks:
+        n_p = sum(len(l) for l in t["layers"])
+        print(Ansi.CYAN + "    Truck {0}: {1} layer(s), {2} panel(s), "
+              "stack {3:.1f}\" (max {4:.1f}\")".format(
+                  t["no"], len(t["layers"]), n_p, t["height"],
+                  st["max_stack_height_in"]) + Ansi.RESET)
+    return output_path
+
+def _sys_is_py2():
+    import sys as _s
+    return _s.version_info[0] == 2
